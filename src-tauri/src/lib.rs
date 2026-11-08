@@ -723,9 +723,9 @@ pub fn run() {
                     .spawn(move || {
                         use tauri::Emitter;
 
-                        // Load already-installed plugins first so they are
-                        // usable immediately (and offline), without waiting
-                        // on any of the network calls below.
+                        // Load plugins that are already on disk. Startup must not
+                        // fetch a remote registry or install native plugin zips:
+                        // those downloads were unsigned and ran on every launch.
                         {
                             let mut mgr = mgr_for_plugins.blocking_write();
                             let _ = mgr.register_builtin(
@@ -750,24 +750,9 @@ pub fn run() {
                         }
                         let _ = app_emit.emit("plugins-changed", ());
 
-                        let rt = match tokio::runtime::Runtime::new() {
-                            Ok(rt) => rt,
-                            Err(e) => {
-                                tracing::warn!("plugins-bootstrap runtime failed: {}", e);
-                                return;
-                            }
-                        };
-                        rt.block_on(commands::plugins::ensure_default_plugins(
-                            std::sync::Arc::clone(&mgr_for_plugins),
-                        ));
-                        rt.block_on(commands::plugins::auto_update_plugins(
-                            std::sync::Arc::clone(&mgr_for_plugins),
-                        ));
-
-                        // Load anything newly installed above. load_all is
-                        // not idempotent (re-inserting drops the previously
-                        // loaded plugin and its dylib), so only load entries
-                        // that are not loaded yet.
+                        // load_all is not idempotent (re-inserting drops the
+                        // previously loaded plugin and its dylib), so only load
+                        // local entries that are not loaded yet.
                         {
                             let mut mgr = mgr_for_plugins.blocking_write();
                             let to_load: Vec<String> = mgr
