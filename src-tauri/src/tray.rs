@@ -200,6 +200,9 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .icon(icon)
         .tooltip("OmniGet")
         .menu(&menu)
+        // On Windows a left click should bring the window back. Right-click
+        // still opens the menu (Open / Quit).
+        .show_menu_on_left_click(!cfg!(target_os = "windows"))
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_window(app),
             "quit" => {
@@ -216,12 +219,18 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::Click {
-                button: tauri::tray::MouseButton::Left,
-                button_state: tauri::tray::MouseButtonState::Up,
-                ..
-            } = event
-            {
+            let restore = matches!(
+                event,
+                tauri::tray::TrayIconEvent::Click {
+                    button: tauri::tray::MouseButton::Left,
+                    button_state: tauri::tray::MouseButtonState::Up,
+                    ..
+                } | tauri::tray::TrayIconEvent::DoubleClick {
+                    button: tauri::tray::MouseButton::Left,
+                    ..
+                }
+            );
+            if restore {
                 show_window(tray.app_handle());
             }
         })
@@ -345,9 +354,15 @@ pub fn compute_total_active(app: &AppHandle) -> u32 {
 }
 
 pub fn show_window(app: &AppHandle) {
+    if app.get_webview_window("main").is_none() {
+        if let Err(error) = crate::ensure_main_window(app) {
+            tracing::warn!("failed to restore main window from tray: {error}");
+            return;
+        }
+    }
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
         let _ = window.unminimize();
+        let _ = window.show();
         let _ = window.set_focus();
     }
 }

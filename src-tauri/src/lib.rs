@@ -174,6 +174,64 @@ impl omniget_core::platforms::bilibili::BilibiliRuntimeProvider for DesktopBilib
     }
 }
 
+/// Creates the main window when it is missing.
+///
+/// The window is not created from `tauri.conf.json` (`"create": false`) so
+/// portable mode can point WebView2 / WebKitGTK at a data directory before
+/// the view starts. Closing the window hides it; if the OS later destroys
+/// that hidden view, the tray icon calls this again.
+pub(crate) fn ensure_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("main").is_some() {
+        return Ok(());
+    }
+
+    // `mut` is only used on Windows and Linux. Without the cfg_attr this is a
+    // new warning on macOS and clippy fails the gate.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
+    let mut builder = tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?;
+
+    // Linux wry uses this path for `base_data_directory`, `base_cache_directory`
+    // and WebKitGTK cookies. Without it, portable mode leaves
+    // `XDG_DATA_HOME/com.openselena.omniget` in the user profile — the same
+    // #209, outside Windows.
+    //
+    // macOS is excluded because wry does not read `data_directory` on
+    // WKWebView; setting it would look like coverage that is not there.
+    #[cfg(any(windows, target_os = "linux"))]
+    if let Some(webview_dir) = core::portable::portable_webview_dir_from_env() {
+        if let Err(e) = std::fs::create_dir_all(&webview_dir) {
+            tracing::warn!(
+                "[portable] nao foi possivel criar {}: {} — o WebView2 vai usar o diretorio padrao",
+                webview_dir.display(),
+                e
+            );
+        } else {
+            tracing::info!(
+                "[portable] WebView2 apontado para {}",
+                webview_dir.display()
+            );
+            builder = builder.data_directory(webview_dir);
+        }
+    }
+
+    // macOS has nowhere to point the webview: wry never reads
+    // `data_directory` on WKWebView. Portable mode does not do what it
+    // promises there. Issue #227.
+    #[cfg(target_os = "macos")]
+    if core::portable::portable_webview_dir_from_env().is_some() {
+        tracing::warn!(
+            "[portable] no macOS o WebView guarda dados em ~/Library mesmo em modo \
+             portatil — o wry nao permite redirecionar. Ver github.com/OpenSelena/omniget/issues/227"
+        );
+    }
+
+    builder.build()?;
+    // The smoke test matches this line exactly. CI compiles every platform
+    // but only this log proves the window was created.
+    tracing::info!("[startup] main window created");
+    Ok(())
+}
+
 fn desktop_bilibili_slug_has_session_cookie(slug: &str) -> bool {
     let path = match crate::cookies::account_path_for_consumer("bilibili.com", Some(slug)) {
         Some(p) => p,
@@ -313,72 +371,10 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            // A janela principal e criada aqui, e nao pelo `tauri.conf.json`
-            // (`"create": false`), porque so daqui da para passar
-            // `.data_directory(...)` ao WebView2. O Tauri resolve esse caminho
-            // para `LocalData/{identifier}` e cria o diretorio *antes* do setup
-            // rodar, entao a variavel de ambiente que o `main.rs` define nunca
-            // chega a ser lida — que e a causa da issue #195, o modo portatil
-            // deixando uma pasta fora do diretorio do app.
-            {
-                // `mut` so e usado no ramo Windows abaixo; sem o cfg_attr isto
-                // vira warning novo em macOS e Linux e reprova o portao de clippy.
-                #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
-                let mut builder = tauri::WebviewWindowBuilder::from_config(
-                    app.handle(),
-                    &app.config().app.windows[0],
-                )?;
-
-                // Nao e so Windows. No Linux o wry usa este caminho para
-                // `base_data_directory`, `base_cache_directory` e os cookies do
-                // WebKitGTK; sem ele o modo portatil deixa
-                // `XDG_DATA_HOME/com.openselena.omniget` no perfil do usuario — a
-                // mesma #209, fora do Windows. Foi o smoke test do B55 que
-                // pegou isso, na primeira vez que rodou.
-                //
-                // macOS fica de fora porque o wry nao le `data_directory` no
-                // WKWebView: incluir daria a impressao de cobrir um caso que
-                // nao esta coberto.
-                #[cfg(any(windows, target_os = "linux"))]
-                if let Some(webview_dir) = core::portable::portable_webview_dir_from_env() {
-                    if let Err(e) = std::fs::create_dir_all(&webview_dir) {
-                        tracing::warn!(
-                            "[portable] nao foi possivel criar {}: {} — o WebView2 vai usar o diretorio padrao",
-                            webview_dir.display(),
-                            e
-                        );
-                    } else {
-                        tracing::info!(
-                            "[portable] WebView2 apontado para {}",
-                            webview_dir.display()
-                        );
-                        builder = builder.data_directory(webview_dir);
-                    }
-                }
-
-                // macOS nao tem para onde apontar: o wry nao le `data_directory`
-                // no WKWebView (nenhuma referencia em `src/wkwebview/`), ao
-                // contrario do webkitgtk, que a usa para base_data_directory,
-                // base_cache_directory e cookies.
-                //
-                // Entao o modo portatil nao cumpre o que promete aqui, e dizer
-                // isso e melhor do que deixar o usuario achar que o pendrive nao
-                // deixou rastro. Issue #227.
-                #[cfg(target_os = "macos")]
-                if core::portable::portable_webview_dir_from_env().is_some() {
-                    tracing::warn!(
-                        "[portable] no macOS o WebView guarda dados em ~/Library mesmo em modo \
-                         portatil — o wry nao permite redirecionar. Ver github.com/OpenSelena/omniget/issues/227"
-                    );
-                }
-
-                builder.build()?;
-
-                // A unica prova de que a janela subiu. O CI compila em todas as
-                // plataformas mas nunca abriu o app: foi assim que a #209 passou
-                // batido. O smoke test do CI casa exatamente esta linha.
-                tracing::info!("[startup] main window created");
-            }
+            // Created here, not from tauri.conf.json (`"create": false`), so
+            // portable mode can pass `.data_directory(...)` before WebView2
+            // resolves `LocalData/{identifier}`. See issue #195.
+            ensure_main_window(app.handle())?;
 
             // Modo smoke: sobe, prova que a janela existe, e sai sozinho com 0.
             // So existe para o CI conseguir responder "abre?", que e a pergunta
@@ -812,8 +808,7 @@ pub fn run() {
                                     tracing::debug!(
                                         "yt-dlp update check deferred: downloads running"
                                     );
-                                    tokio::time::sleep(std::time::Duration::from_secs(300))
-                                        .await;
+                                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                                 }
                                 Err(e) => {
                                     tracing::warn!("yt-dlp update check failed: {}", e);
@@ -903,6 +898,9 @@ pub fn run() {
             commands::ai::ai_get_config,
             commands::ai::ai_set_config,
             commands::ai::ai_test,
+            commands::ai::llm_chat,
+            commands::ai::canvas_load,
+            commands::ai::canvas_save,
             commands::ai::ai_summarize_url,
             commands::ai::whisper_generate,
             commands::ai::ai_history_list,
@@ -1281,7 +1279,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = &event {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                // `None` is the runtime quitting because the last window went
+                // away. The close button hides that window and the tray icon
+                // brings it back, so this exit must not proceed. Tray Quit,
+                // force_exit_app, and restart pass a code and still exit.
+                if code.is_none() {
+                    api.prevent_exit();
+                    return;
+                }
+
                 let state = app_handle.state::<AppState>();
                 let session_mutex = state.torrent_session.clone();
                 tauri::async_runtime::block_on(async move {
