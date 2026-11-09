@@ -1,15 +1,12 @@
 const STORAGE_KEY = "omniget_sniffer_enabled";
 const WILDCARD_ORIGINS = ["*://*/*"];
 
-let enabled = true;
+let enabled = false;
 
-// Resolves once the stored flag has actually been read. The webRequest
-// listeners are registered synchronously — that is what lets an incoming
-// request wake a terminated service worker at all — so they can fire before
-// this settles. They capture optimistically against the default, and the
-// decision to *keep* what they captured is deferred until this promise
-// answers. Without it, a user who turned detection off still gets whatever
-// arrived during the boot window recorded and persisted.
+// Default off. All-sites capture stays off until the stored flag is exactly
+// true, including during the boot window before storage answers. The webRequest
+// listeners are registered synchronously so an incoming request can wake a
+// terminated service worker, and they can fire before this settles.
 let statePromise = null;
 
 export function loadSnifferState() {
@@ -17,7 +14,7 @@ export function loadSnifferState() {
     statePromise = (async () => {
       try {
         const result = await chrome.storage.local.get(STORAGE_KEY);
-        enabled = result[STORAGE_KEY] !== false;
+        enabled = result[STORAGE_KEY] === true;
       } catch {
         // Storage unavailable: keep the default rather than fail the boot.
       }

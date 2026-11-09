@@ -418,24 +418,21 @@ async fn download_ffmpeg() -> anyhow::Result<PathBuf> {
 
     let downloads = ffmpeg_download_urls();
 
-    let client = crate::core::http_client::apply_global_proxy(reqwest::Client::builder())
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
-
     for (url, archive_type) in downloads {
         tracing::info!("Downloading FFmpeg component from {}", url);
-        let response = client.get(url).send().await?;
-        if !response.status().is_success() {
+        let Some((owner, repo, tag, asset)) = github_release_asset_from_url(url) else {
             return Err(anyhow!(
-                "Failed to download FFmpeg from {}: HTTP {}",
-                url,
-                response.status()
+                "Refusing unverified FFmpeg download from {url}"
             ));
-        }
+        };
+        let data = download_github_release_asset(
+            &format!("{owner}/{repo}"),
+            Some(tag),
+            asset,
+        )
+        .await?;
 
         let temp_path = bin_dir.join(".ffmpeg_download.tmp");
-        let bytes = response.bytes().await?;
-        let data = bytes.to_vec();
         let temp_clone = temp_path.clone();
         tokio::task::spawn_blocking(move || std::fs::write(&temp_clone, &data))
             .await
@@ -747,6 +744,76 @@ pub async fn ensure_js_runtime() -> Option<PathBuf> {
     }
 }
 
+/// `https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}`.
+fn github_release_asset_from_url(url: &str) -> Option<(&str, &str, &str, &str)> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let (owner, rest) = rest.split_once('/')?;
+    let (repo, rest) = rest.split_once('/')?;
+    let rest = rest.strip_prefix("releases/download/")?;
+    let (tag, asset) = rest.split_once('/')?;
+    if owner.is_empty()
+        || repo.is_empty()
+        || tag.is_empty()
+        || asset.is_empty()
+        || asset.contains('/')
+        || owner.contains('.')
+        || repo.contains('.')
+    {
+        return None;
+    }
+    Some((owner, repo, tag, asset))
+}
+
+/// Downloads one GitHub release asset and keeps it only when the API digest
+/// is `sha256:` and the bytes match. `tag` of `None` selects the latest release.
+async fn download_github_release_asset(
+    repo: &str,
+    tag: Option<&str>,
+    asset_name: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let api_url = match tag {
+        Some(tag) => format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"),
+        None => format!("https://api.github.com/repos/{repo}/releases/latest"),
+    };
+    let client = crate::core::http_client::apply_global_proxy(reqwest::Client::builder())
+        .user_agent("OmniGet")
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let response = client
+        .get(&api_url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| anyhow!("Could not query {api_url}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(anyhow!(
+            "Could not query {api_url}: HTTP {}",
+            response.status()
+        ));
+    }
+    let release: serde_json::Value = response.json().await?;
+    let assets = release["assets"]
+        .as_array()
+        .ok_or_else(|| anyhow!("release of {repo} has no assets"))?;
+    let asset = assets
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some(asset_name))
+        .ok_or_else(|| anyhow!("release of {repo} has no {asset_name}"))?;
+    let expected = asset["digest"]
+        .as_str()
+        .and_then(integrity::parse_github_digest)
+        .ok_or_else(|| {
+            anyhow!("{asset_name} has no sha256 digest from GitHub; download discarded")
+        })?;
+    let url = asset["browser_download_url"]
+        .as_str()
+        .filter(|url| url.starts_with("https://"))
+        .ok_or_else(|| anyhow!("{asset_name} has no https download URL"))?;
+    let bytes = client.get(url).send().await?.error_for_status()?.bytes().await?;
+    integrity::verify_sha256(&bytes, &expected, asset_name)?;
+    Ok(bytes.to_vec())
+}
+
 async fn download_deno() -> anyhow::Result<PathBuf> {
     let bin_dir = managed_bin_dir().ok_or_else(|| anyhow!("Could not determine data directory"))?;
     std::fs::create_dir_all(&bin_dir)?;
@@ -758,36 +825,22 @@ async fn download_deno() -> anyhow::Result<PathBuf> {
         return Ok(deno_target);
     }
 
-    let url = if cfg!(target_os = "windows") {
-        "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+    let asset_name = if cfg!(target_os = "windows") {
+        "deno-x86_64-pc-windows-msvc.zip"
     } else if cfg!(target_os = "macos") {
         if cfg!(target_arch = "aarch64") {
-            "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-apple-darwin.zip"
+            "deno-aarch64-apple-darwin.zip"
         } else {
-            "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-apple-darwin.zip"
+            "deno-x86_64-apple-darwin.zip"
         }
     } else if cfg!(target_arch = "aarch64") {
-        "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip"
+        "deno-aarch64-unknown-linux-gnu.zip"
     } else {
-        "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
+        "deno-x86_64-unknown-linux-gnu.zip"
     };
 
-    tracing::info!("Downloading Deno JS runtime from {}", url);
-
-    let client = crate::core::http_client::apply_global_proxy(reqwest::Client::builder())
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Failed to download Deno: HTTP {}",
-            response.status()
-        ));
-    }
-
-    let bytes = response.bytes().await?;
-    let data = bytes.to_vec();
+    tracing::info!("Downloading Deno JS runtime {asset_name} from denoland/deno");
+    let data = download_github_release_asset("denoland/deno", None, asset_name).await?;
     let bin_dir_clone = bin_dir.clone();
     let deno_name_clone = deno_name.clone();
 
@@ -864,28 +917,15 @@ async fn download_gallerydl() -> anyhow::Result<PathBuf> {
     // Os executaveis standalone vivem no repo gdl-org/builds (Windows, Linux
     // e macOS); o release do mikf/gallery-dl nao publica mais assets.
     #[cfg(target_os = "windows")]
-    let url = "https://github.com/gdl-org/builds/releases/latest/download/gallery-dl_windows.exe";
+    let asset_name = "gallery-dl_windows.exe";
     #[cfg(target_os = "linux")]
-    let url = "https://github.com/gdl-org/builds/releases/latest/download/gallery-dl_linux";
+    let asset_name = "gallery-dl_linux";
     #[cfg(target_os = "macos")]
-    let url = "https://github.com/gdl-org/builds/releases/latest/download/gallery-dl_macos";
+    let asset_name = "gallery-dl_macos";
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     return Err(anyhow!("gallery-dl nao tem binario para este sistema"));
 
-    let client = crate::core::http_client::apply_global_proxy(reqwest::Client::builder())
-        .timeout(std::time::Duration::from_secs(180))
-        .build()?;
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Failed to download gallery-dl: HTTP {}",
-            response.status()
-        ));
-    }
-
-    let bytes = response.bytes().await?;
-    let data = bytes.to_vec();
+    let data = download_github_release_asset("gdl-org/builds", None, asset_name).await?;
     let target_clone = target.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         std::fs::write(&target_clone, &data)?;
@@ -935,23 +975,12 @@ async fn download_aria2c() -> anyhow::Result<PathBuf> {
     let aria2c_name = bin_name("aria2c");
     let aria2c_target = bin_dir.join(&aria2c_name);
 
-    let url = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip";
-
-    let client = crate::core::http_client::apply_global_proxy(reqwest::Client::builder())
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
-
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Failed to download aria2c: HTTP {}",
-            response.status()
-        ));
-    }
-
-    let bytes = response.bytes().await?;
-
-    let data = bytes.to_vec();
+    let data = download_github_release_asset(
+        "aria2/aria2",
+        Some("release-1.37.0"),
+        "aria2-1.37.0-win-64bit-build1.zip",
+    )
+    .await?;
     let bin_dir_clone = bin_dir.clone();
     let aria2c_name_clone = aria2c_name.clone();
 
@@ -1061,6 +1090,23 @@ mod integrity_tests {
         let mac_intel = ffmpeg_download_urls_for("macos", "x86_64");
         assert_eq!(mac_intel.len(), 2);
         assert!(mac_intel[0].0.contains("evermeet.cx"));
+
+        assert_eq!(
+            super::github_release_asset_from_url(
+                "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+            ),
+            Some((
+                "BtbN",
+                "FFmpeg-Builds",
+                "latest",
+                "ffmpeg-master-latest-win64-gpl.zip"
+            ))
+        );
+        assert!(super::github_release_asset_from_url(
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip"
+        )
+        .is_none());
+        assert!(super::github_release_asset_from_url("https://evil.example/github.com/a/b").is_none());
 
         let win = ffmpeg_download_urls_for("windows", "x86_64");
         assert_eq!(win.len(), 1);

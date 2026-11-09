@@ -97,8 +97,17 @@ test("requestWildcardHostPermission returns true when chrome.permissions.request
   assert.equal(granted, true);
 });
 
-test("loadSnifferState defaults to enabled when no prior setting", async () => {
+test("loadSnifferState stays off when no prior setting", async () => {
   globalThis.chrome = makeChromeStub({ storage: {} });
+  const mod = await loadModuleFresh();
+
+  const enabled = await mod.loadSnifferState();
+
+  assert.equal(enabled, false);
+});
+
+test("loadSnifferState honours a previously-enabled flag", async () => {
+  globalThis.chrome = makeChromeStub({ storage: { omniget_sniffer_enabled: true } });
   const mod = await loadModuleFresh();
 
   const enabled = await mod.loadSnifferState();
@@ -141,7 +150,7 @@ test("loadSnifferState reflects a toggle made after the first read", async () =>
   globalThis.chrome = makeChromeStub({ grant: true, storage: {} });
   const mod = await loadModuleFresh();
 
-  assert.equal(await mod.loadSnifferState(), true);
+  assert.equal(await mod.loadSnifferState(), false);
   await mod.setSnifferEnabled(false);
   assert.equal(await mod.loadSnifferState(), false);
   await mod.setSnifferEnabled(true);
@@ -152,5 +161,5 @@ test("loadSnifferState keeps the default when storage throws", async () => {
   globalThis.chrome = { storage: { local: { get: async () => { throw new Error("no storage"); } } } };
   const mod = await loadModuleFresh();
 
-  assert.equal(await mod.loadSnifferState(), true);
+  assert.equal(await mod.loadSnifferState(), false);
 });

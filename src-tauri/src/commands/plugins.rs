@@ -382,6 +382,83 @@ struct GitHubRelease {
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+const PLUGIN_ALLOWLIST_JSON: &str = include_str!("../../plugin-allowlist.json");
+
+#[derive(Debug, Deserialize)]
+struct PluginAllowlist {
+    pins: Vec<PluginPin>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginPin {
+    id: String,
+    repo: String,
+    tag: String,
+    sha256: std::collections::BTreeMap<String, String>,
+}
+
+fn plugin_allowlist() -> Result<PluginAllowlist, String> {
+    serde_json::from_str(PLUGIN_ALLOWLIST_JSON)
+        .map_err(|e| format!("Plugin allowlist is invalid: {e}"))
+}
+
+fn validate_plugin_repo(repo: &str) -> Result<(), String> {
+    let mut parts = repo.split('/');
+    let owner = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    let extra = parts.next();
+    let piece_ok = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with('.')
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if extra.is_none() && piece_ok(owner) && piece_ok(name) {
+        Ok(())
+    } else {
+        Err(format!("Refusing plugin repo '{repo}'"))
+    }
+}
+
+fn validate_plugin_tag(tag: &str) -> Result<(), String> {
+    let ok = !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("Refusing plugin release tag '{tag}'"))
+    }
+}
+
+fn normalized_sha256(value: &str) -> Option<String> {
+    let hex = value.trim().trim_start_matches("sha256:").to_ascii_lowercase();
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+}
+
+fn require_plugin_pin(plugin_id: &str, repo: &str) -> Result<PluginPin, String> {
+    validate_plugin_repo(repo)?;
+    let list = plugin_allowlist()?;
+    list.pins
+        .into_iter()
+        .find(|pin| pin.id == plugin_id && pin.repo == repo)
+        .ok_or_else(|| {
+            format!(
+                "Remote plugin install is disabled for '{plugin_id}'. This fork only installs a plugin when its repo, release tag, and zip sha256 are pinned in src-tauri/plugin-allowlist.json."
+            )
+        })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub async fn install_plugin_zip_from_repo(
@@ -394,6 +471,14 @@ pub async fn install_plugin_zip_from_repo(
         return Err("Unsupported platform".to_string());
     }
 
+    let pin = require_plugin_pin(&plugin_id, &repo)?;
+    validate_plugin_tag(&pin.tag)?;
+    let expected = pin
+        .sha256
+        .get(suffix)
+        .and_then(|value| normalized_sha256(value))
+        .ok_or_else(|| format!("Plugin '{plugin_id}' has no sha256 pin for {suffix}"))?;
+
     let client = crate::core::http_client::apply_global_proxy(
         reqwest::Client::builder()
             .user_agent("OmniGet")
@@ -403,9 +488,16 @@ pub async fn install_plugin_zip_from_repo(
     .build()
     .map_err(|e| e.to_string())?;
 
-    let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    let api_url = format!(
+        "https://api.github.com/repos/{}/releases/tags/{}",
+        pin.repo, pin.tag
+    );
     let release: GitHubRelease = client
         .get(&api_url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.github+json",
+        )
         .send()
         .await
         .map_err(|e| format!("NetworkUnreachable|Failed to fetch release: {}", e))?
@@ -419,6 +511,30 @@ pub async fn install_plugin_zip_from_repo(
         .find(|a| a.name.contains(suffix) && a.name.ends_with(".zip"))
         .ok_or_else(|| format!("No artifact found for {}", suffix))?;
 
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(normalized_sha256)
+        .ok_or_else(|| {
+            format!(
+                "{} has no sha256 digest from GitHub; download discarded",
+                asset.name
+            )
+        })?;
+    if digest != expected {
+        return Err(format!(
+            "Pinned sha256 for {} does not match the GitHub release digest; download discarded",
+            asset.name
+        ));
+    }
+
+    if !asset.browser_download_url.starts_with("https://") {
+        return Err(format!(
+            "{} has a non-https download URL; download discarded",
+            asset.name
+        ));
+    }
+
     let zip_bytes = client
         .get(&asset.browser_download_url)
         .send()
@@ -427,6 +543,13 @@ pub async fn install_plugin_zip_from_repo(
         .bytes()
         .await
         .map_err(|e| format!("NetworkUnreachable|Failed to read download: {}", e))?;
+
+    let actual = sha256_hex(&zip_bytes);
+    if actual != expected {
+        return Err(format!(
+            "Plugin zip hash does not match the pin — expected {expected}, got {actual}. Download discarded."
+        ));
+    }
 
     let plugin_dir = {
         let manager = state.read().await;
@@ -517,39 +640,22 @@ pub async fn check_plugin_updates(
         manager.installed_plugins().to_vec()
     };
 
-    let client = crate::core::http_client::apply_global_proxy(
-        reqwest::Client::builder()
-            .user_agent("OmniGet")
-            .timeout(std::time::Duration::from_secs(15)),
-    )
-    .build()
-    .map_err(|e| e.to_string())?;
-
+    let allow = plugin_allowlist()?;
     let mut updates = Vec::new();
 
     for plugin in &installed {
-        let repo = match &plugin.repo {
-            Some(r) => r.clone(),
-            None => continue,
+        let Some(pin) = allow.pins.iter().find(|pin| pin.id == plugin.id) else {
+            continue;
         };
 
-        let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-        let release: GitHubRelease = match client.get(&api_url).send().await {
-            Ok(resp) => match resp.json().await {
-                Ok(r) => r,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-
-        let latest = release.tag_name.trim_start_matches('v').to_string();
+        let latest = pin.tag.trim_start_matches('v').to_string();
         let has_update = latest != plugin.version;
 
         updates.push(PluginUpdateInfo {
             id: plugin.id.clone(),
             installed_version: plugin.version.clone(),
             latest_version: latest,
-            repo,
+            repo: pin.repo.clone(),
             has_update,
         });
     }
@@ -565,4 +671,45 @@ pub async fn update_plugin(
     repo: String,
 ) -> Result<String, String> {
     install_plugin_from_registry(app, state, plugin_id, repo).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalized_sha256, plugin_allowlist, require_plugin_pin, validate_plugin_repo, validate_plugin_tag};
+
+    #[test]
+    fn allowlist_starts_with_no_remote_plugins() {
+        let list = plugin_allowlist().expect("allowlist json");
+        assert!(list.pins.is_empty());
+    }
+
+    #[test]
+    fn repo_must_be_a_single_owner_and_name() {
+        assert!(validate_plugin_repo("OpenSelena/omniget-plugins").is_ok());
+        assert!(validate_plugin_repo("https://evil.example/x").is_err());
+        assert!(validate_plugin_repo("../etc").is_err());
+        assert!(validate_plugin_repo("a/b/c").is_err());
+        assert!(validate_plugin_repo(".hidden/name").is_err());
+    }
+
+    #[test]
+    fn tag_rejects_path_characters() {
+        assert!(validate_plugin_tag("v1.2.3").is_ok());
+        assert!(validate_plugin_tag("release-1.37.0").is_ok());
+        assert!(validate_plugin_tag("../v1").is_err());
+        assert!(validate_plugin_tag("v1/latest").is_err());
+    }
+
+    #[test]
+    fn unpinned_plugin_is_refused_before_any_download() {
+        let err = require_plugin_pin("courses", "OpenSelena/omniget-courses").unwrap_err();
+        assert!(err.contains("disabled"));
+    }
+
+    #[test]
+    fn sha256_accepts_a_github_digest_prefix() {
+        let hex = "ab".repeat(32);
+        assert_eq!(normalized_sha256(&format!("sha256:{hex}")).as_deref(), Some(hex.as_str()));
+        assert!(normalized_sha256("dead").is_none());
+    }
 }
