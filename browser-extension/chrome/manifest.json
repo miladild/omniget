@@ -76,7 +76,9 @@
     "*://*.bilivideo.com/*",
     "*://b23.tv/*",
     "*://*.soundcloud.com/*",
-    "*://*.sndcdn.com/*"
+    "*://*.sndcdn.com/*",
+    "*://*.oreilly.com/*",
+    "*://*.oreillystatic.com/*"
   ],
   "optional_host_permissions": [
     "*://*/*"
@@ -113,5 +115,12 @@
   "options_ui": {
     "page": "pages/options.html",
     "open_in_tab": true
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.oreilly.com/*", "*://*.oreillystatic.com/*"],
+      "js": ["src/oreilly-export.js"],
+      "run_at": "document_end"
+    }
+  ]
 }

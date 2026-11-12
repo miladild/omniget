@@ -64,6 +64,7 @@ async function init() {
   } catch {}
 
   initCookieCapture(activeTab);
+  initOReillyExport(activeTab);
 
   const h264Toggle = document.getElementById("h264-toggle");
   chrome.runtime.sendMessage({ type: "getH264" }, (r) => { if (r && h264Toggle) h264Toggle.checked = r.enabled; });
@@ -636,6 +637,59 @@ function escapeHtml(str) {
   const d = document.createElement("div");
   d.textContent = str;
   return d.innerHTML;
+}
+
+function isOReillyHost(hostname) {
+  return /(^|\.)oreilly\.com$/i.test(hostname || "") || /(^|\.)oreillystatic\.com$/i.test(hostname || "");
+}
+
+function initOReillyExport(activeTab) {
+  const wrap = document.getElementById("oreilly-export");
+  const btn = document.getElementById("oreilly-export-btn");
+  const label = document.getElementById("oreilly-export-label");
+  const hint = document.getElementById("oreilly-export-hint");
+  if (!wrap || !btn || !label) return;
+
+  let host = "";
+  try { host = new URL(activeTab?.url || "").hostname; } catch {}
+  const onBook = isOReillyHost(host);
+  wrap.dataset.state = "shown";
+  if (!onBook && hint) hint.textContent = "Switch to the O'Reilly book tab, then click this.";
+
+  btn.addEventListener("click", async () => {
+    if (!onBook) {
+      label.textContent = "Open the book first";
+      btn.dataset.state = "error";
+      return;
+    }
+    btn.disabled = true;
+    label.textContent = "Saving…";
+    btn.removeAttribute("data-state");
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: activeTab.id },
+        files: ["src/oreilly-export.js"],
+      });
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId: activeTab.id },
+        func: () => {
+          const button = document.getElementById("omniget-oreilly-pdf");
+          if (!button) return { ok: false, reason: "The book page did not add the button." };
+          button.click();
+          return { ok: true };
+        },
+      });
+      if (!injected?.result?.ok) throw new Error(injected?.result?.reason || "The book page did not start.");
+      label.textContent = "Saving on the book page";
+      if (hint) hint.textContent = "Keep this tab open until the PDF downloads.";
+    } catch (error) {
+      label.textContent = "Could not start";
+      if (hint) hint.textContent = error?.message || "The book page did not start.";
+      btn.dataset.state = "error";
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
 
 function initCookieCapture(activeTab) {

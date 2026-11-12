@@ -336,6 +336,11 @@ body {
   gap: 4px;
 }
 .cookie-capture[data-state="hidden"] { display: none; }
+.oreilly-export .cookie-btn {
+  background: #d32f2f;
+  border-color: #d32f2f;
+  color: #fff;
+}
 .cookie-btn {
   display: inline-flex;
   align-items: center;
