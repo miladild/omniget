@@ -7,7 +7,7 @@ const code = await readFile(new URL("../src/oreilly-export.js", import.meta.url)
 const sandbox = { console, URL, Blob, setInterval, clearInterval, TextEncoder, TextDecoder }
 vm.createContext(sandbox)
 vm.runInContext(code, sandbox)
-const { bookFileName, bookIsbn, buildBookPdf, chapterHrefs, collectBookPages, isOReillyHost, layoutBlocks, layoutContents, nextPageUrl, paginateBook, pdfEscape, pickNextControl, textWidth } = sandbox
+const { bookFileName, bookIsbn, buildBookPdf, chapterHrefs, collectBookPages, isOReillyHost, layoutBlocks, layoutContents, nextPageUrl, paginateBook, pdfEscape, pickNextControl, readableHeading, textWidth } = sandbox
 
 test("recognises the O'Reilly hosts the content script is allowed to run on", () => {
   assert.equal(isOReillyHost("learning.oreilly.com"), true)
@@ -29,6 +29,12 @@ test("keeps quotes, dashes, and accents instead of question marks", () => {
   assert.match(encoded, /\\222/)
   assert.match(encoded, /\\227/)
   assert.match(encoded, /\\351/)
+})
+
+test("removes underscore emphasis from headings", () => {
+  assert.equal(readableHeading("Why _Now_ for AI"), "Why Now for AI")
+  assert.equal(readableHeading("foundation_models.html"), "foundation models")
+  assert.equal(readableHeading("Use top_p carefully"), "Use top_p carefully")
 })
 
 test("names one file for the book", () => {
@@ -150,6 +156,75 @@ test("keeps headings and figure captions together and drops empty pages", () => 
   const icon = layoutBlocks([{ kind: "img", jpeg: Uint8Array.of(1), pixelWidth: 32, pixelHeight: 32, caption: "Icon" }])
   assert.ok(icon.flat().find((line) => line.image).w < 40)
   assert.equal(layoutBlocks([{ kind: "skip" }]).length, 0)
+})
+
+test("keeps web links and points chapter mentions at that chapter", () => {
+  const sheets = layoutBlocks([
+    { kind: "p", pieces: [
+      { text: "See Chapter 2 and " },
+      { text: "the site", link: { type: "uri", href: "https://example.com/docs" } },
+      { text: " later." },
+    ] },
+  ])
+  const line = sheets.flat().find((item) => String(item.text).includes("Chapter 2"))
+  const chapter = line.links.find((mark) => mark.link.number === 2)
+  const site = line.links.find((mark) => mark.link.href === "https://example.com/docs")
+  assert.ok(chapter.w > 0)
+  assert.ok(chapter.w < textWidth(line.text, line.size))
+  assert.ok(site.x > chapter.x)
+  const pdf = new TextDecoder().decode(buildBookPdf([
+    { heading: "1. Start", file: "ch01.html", blocks: [
+      { kind: "h1", text: "1. Start" },
+      { kind: "p", text: "Read Chapter 2 next.", pieces: [
+        { text: "Read Chapter 2 next. " },
+        { text: "the site", link: { type: "uri", href: "https://example.com/docs" } },
+      ] },
+    ] },
+    { heading: "2. Models", file: "ch02.html", blocks: [
+      { kind: "h1", text: "2. Models" },
+      { kind: "p", text: "Models live here." },
+    ] },
+  ], "Book"))
+  assert.match(pdf, /\/URI \(https:\/\/example.com\/docs\)/)
+  assert.match(pdf, /0\.12 0\.35 0\.62 rg/)
+  assert.match(pdf, /\(Chapter 2\)/)
+  assert.match(pdf, /\(the site\)/)
+  assert.match(pdf, /2\. Models/)
+})
+
+test("keeps table items on their own lines and wraps the caption", () => {
+  const sheets = layoutBlocks([{
+    kind: "table",
+    header: true,
+    caption: "Table 1-2. Occupations with the highest exposure to AI as annotated by humans. This note refers to exposure to AI models directly.",
+    rows: [
+      ["Group", "Occupations with highest exposure", "% Exposure"],
+      ["Human", "Interpreters and translators\nSurvey researchers\nPoets, lyricists, and writers", "76.5\n75.0\n68.8"],
+    ],
+  }])
+  const body = sheets.flat().find((line) => line.tableRow && line.cells[0][0] === "Human")
+  assert.deepEqual(JSON.parse(JSON.stringify(body.cells[1])), ["Interpreters and translators", "Survey researchers", "Poets, lyricists, and writers"])
+  assert.deepEqual(JSON.parse(JSON.stringify(body.cells[2])), ["76.5", "75.0", "68.8"])
+  const caption = sheets.flat().map((line) => line.text || "").join(" ")
+  assert.match(caption, /directly/)
+  assert.ok(caption.length > "Table 1-2.".length)
+})
+
+test("puts the cover on the first page", () => {
+  const jpeg = Uint8Array.of(0xff, 0xd8, 0xff, 0xd9)
+  const pdf = buildBookPdf([
+    { heading: "Preface", text: "When ChatGPT came out." },
+  ], "Preface | AI Engineering", { jpeg, pixelWidth: 400, pixelHeight: 600 })
+  const text = new TextDecoder().decode(pdf)
+  assert.match(text, /\/Count 3/)
+  assert.match(text, /\(Cover\)/)
+  assert.match(text, /\/Subtype \/Image/)
+  let found = false
+  for (let index = 0; index <= pdf.length - jpeg.length; index += 1) {
+    found = jpeg.every((byte, offset) => pdf[index + offset] === byte)
+    if (found) break
+  }
+  assert.equal(found, true)
 })
 
 test("writes one PDF that contains every section", () => {

@@ -72,7 +72,7 @@ function chapterHrefs(hrefs, currentHref) {
 }
 
 const BLOCK_STYLES = {
-  h1: { font: "F2", size: 18, leading: 22, color: "0.55 0.09 0.11", gap: 12, rule: true, breakBefore: true, highlight: true },
+  h1: { font: "F2", size: 18, leading: 22, color: "0.18 0.22 0.28", gap: 12, breakBefore: true, highlight: true },
   h2: { font: "F2", size: 13, leading: 17, color: "0.12 0.12 0.12", gap: 8 },
   h3: { font: "F2", size: 12, leading: 16, color: "0.2 0.2 0.2", gap: 6 },
   h4: { font: "F2", size: 11, leading: 15, color: "0.25 0.25 0.25", gap: 4 },
@@ -117,6 +117,53 @@ function chapterBlocks(page) {
   return blocks.length ? blocks : [{ kind: "p", text: "(empty)" }]
 }
 
+function linkFromHref(href) {
+  const raw = String(href || "").trim()
+  if (!raw || /^javascript:/i.test(raw) || raw.startsWith("#")) return null
+  if (/^mailto:/i.test(raw)) return { type: "uri", href: raw }
+  let url
+  try { url = new URL(raw, "https://learning.oreilly.com/files/chapter.html") } catch { return null }
+  const file = decodeURIComponent((url.pathname.split("/").pop() || "").split("?")[0]).toLowerCase()
+  const numbered = file.match(/^(?:ch|chapter)0*(\d+)\b/i)
+  if (numbered) return { type: "chapter", number: Number(numbered[1]), file }
+  const oreilly = /(^|\.)oreilly\.com$/i.test(url.hostname) || /(^|\.)oreillystatic\.com$/i.test(url.hostname)
+  if (oreilly && /\.x?html?$/i.test(file)) return { type: "file", file }
+  if (/^https?:$/i.test(url.protocol)) return { type: "uri", href: url.href }
+  return null
+}
+
+function chapterMentions(pieces) {
+  const out = []
+  for (const piece of pieces || []) {
+    if (!piece?.text) continue
+    if (piece.link) {
+      out.push(piece)
+      continue
+    }
+    const pattern = /\b((?:chapters?|chaps?|ch)\.?\s+)(\d{1,2})\b/gi
+    let last = 0
+    let match
+    let found = false
+    while ((match = pattern.exec(piece.text))) {
+      found = true
+      if (match.index > last) out.push({ text: piece.text.slice(last, match.index), link: null })
+      out.push({ text: match[0], link: { type: "chapter", number: Number(match[2]) } })
+      last = match.index + match[0].length
+    }
+    if (!found) out.push({ text: piece.text, link: null })
+    else if (last < piece.text.length) out.push({ text: piece.text.slice(last), link: null })
+  }
+  return out
+}
+
+function chapterNumberFrom(file, heading) {
+  const name = String(file || "").split("?")[0].split("/").pop().toLowerCase()
+  const fromFile = name.match(/^(?:ch|chapter)0*(\d+)\b/i)
+  if (fromFile) return { file: name, number: Number(fromFile[1]) }
+  const fromHeading = String(heading || "").match(/^\s*chapter\s+(\d{1,2})\b/i) || String(heading || "").match(/^\s*(\d{1,2})\s*[.)]\s+\S/)
+  return { file: name, number: fromHeading ? Number(fromHeading[1]) : 0 }
+}
+
 function sheetHasBody(lines) {
   return (lines || []).some((line) => line.image || line.tableRow || String(line.text || "").trim())
 }
@@ -140,10 +187,13 @@ function layoutBlocks(blocks) {
     if (y < bottom && !lines.length) y = top - (size + 4)
     lines.push({ text, font, size, color, x, y })
   }
+  const placeWrapped = (text, font, size, color, x, width) => {
+    for (const line of wrapToWidth(text, size, width)) placeText(line, font, size, color, x)
+  }
   const placeFigure = (block) => {
     const caption = String(block.caption || block.alt || "").replace(/\s+/g, " ").trim()
     if (!block.jpeg?.length || !block.pixelWidth || !block.pixelHeight) {
-      if (caption) placeText(caption, "F1", 10, "0.35 0.35 0.35", MARGIN)
+      if (caption) placeWrapped(caption, "F1", 10, "0.35 0.35 0.35", MARGIN, contentWidth)
       return
     }
     let w = block.pixelWidth * 72 / 110
@@ -187,7 +237,7 @@ function layoutBlocks(blocks) {
   const placeTable = (block) => {
     const rows = (block.rows || []).filter((row) => row.some((cell) => String(cell || "").trim()))
     if (!rows.length) {
-      if (block.caption) placeText(block.caption, "F2", 10, "0.2 0.2 0.2", MARGIN)
+      if (block.caption) placeWrapped(block.caption, "F2", 10, "0.2 0.2 0.2", MARGIN, contentWidth)
       return
     }
     const cols = Math.max(...rows.map((row) => row.length))
@@ -197,7 +247,8 @@ function layoutBlocks(blocks) {
     const natural = Array.from({ length: cols }, () => 40)
     for (const row of rows) {
       row.forEach((cell, index) => {
-        natural[index] = Math.max(natural[index], Math.min(textWidth(cell, fontSize) + pad * 2, 240))
+        const widest = String(cell || "").split("\n").reduce((max, line) => Math.max(max, textWidth(line, fontSize)), 0)
+        natural[index] = Math.max(natural[index], Math.min(widest + pad * 2, 280))
       })
     }
     const used = natural.reduce((sum, width) => sum + width, 0)
@@ -225,9 +276,10 @@ function layoutBlocks(blocks) {
         fitted.push({ cells, height: used * leading + pad * 2 })
       }
     }
-    const opening = (block.caption ? 18 : 0) + (fitted[0]?.height || 0) + (fitted[1]?.height || 0)
+    const captionLines = block.caption ? wrapToWidth(block.caption, 10, contentWidth) : []
+    const opening = captionLines.length * 14 + (fitted[0]?.height || 0) + (fitted[1]?.height || 0)
     if (lines.length && opening < pageBody && y - opening < bottom) nextSheet()
-    if (block.caption) placeText(block.caption, "F2", 10, "0.2 0.2 0.2", MARGIN)
+    for (const line of captionLines) placeText(line, "F2", 10, "0.2 0.2 0.2", MARGIN)
     let header = null
     const drawRow = (row, isHeader) => {
       if (lines.length && y - row.height < bottom) {
@@ -277,13 +329,31 @@ function layoutBlocks(blocks) {
       if (left > take && left - take === 1 && take > 2) take -= 1
       for (let step = 0; step < take; step += 1) {
         const at = index + step
+        const x = MARGIN + (style.indent || 0)
+        let runs = wrapped[at].map((run) => ({ text: run.text, link: run.link || null }))
+        if (style.bullet && at === 0) runs = [{ text: "• ", link: null }, ...runs]
         y -= style.leading
+        const links = []
+        let cursor = x
+        const text = runs.map((run) => run.text).join("")
+        for (const run of runs) {
+          const width = textWidth(run.text, style.size)
+          if (run.link) {
+            const last = links[links.length - 1]
+            const same = last && JSON.stringify(last.link) === JSON.stringify(run.link) && Math.abs(last.x + last.w - cursor) < 0.8
+            if (same) last.w += width
+            else links.push({ x: cursor, w: width, link: run.link })
+          }
+          cursor += width
+        }
         lines.push({
-          text: style.bullet && at === 0 ? `• ${wrapped[at]}` : wrapped[at],
+          text,
+          runs,
+          links,
           font: style.font,
           size: style.size,
           color: style.color,
-          x: MARGIN + (style.indent || 0),
+          x,
           y,
           highlight: Boolean(style.highlight && at === 0),
           rule: Boolean(style.rule && at === wrapped.length - 1),
@@ -314,9 +384,12 @@ function layoutBlocks(blocks) {
       const reserve = portrait ? 0 : style.leading + (style.gap || 0) + ((BLOCK_STYLES[next?.kind] || BLOCK_STYLES.p).leading * 2)
       if (reserve && y - reserve < bottom) nextSheet()
     }
-    const pieces = block.kind === "pre" ? String(block.text || "").split("\n") : [block.text]
-    const limit = Math.max(24, Math.floor((contentWidth - (style.indent || 0)) / (style.size * 0.52)))
-    const wrapped = pieces.flatMap((piece) => wrapText(piece, limit)).filter((line) => line !== "")
+    const width = Math.max(24, contentWidth - (style.indent || 0))
+    const source = block.pieces?.length ? block.pieces : [{ text: block.text || "", link: null }]
+    const linked = block.kind === "h1" || block.kind === "pre" ? source : chapterMentions(source)
+    const wrapped = block.kind === "pre"
+      ? String(block.text || "").split("\n").map((line) => line.trim()).filter(Boolean).map((line) => [{ text: line, link: null }])
+      : wrapPieces(linked, style.size, width)
     const blockHeight = wrapped.length * style.leading + (style.gap || 0)
     if ((block.kind === "pre" || block.kind === "quote") && wrapped.length > 1 && wrapped.length <= 12 && blockHeight <= pageRoom && lines.length && y - blockHeight < bottom) {
       nextSheet()
@@ -368,22 +441,65 @@ function chunksForWidth(word, size, maxWidth) {
 }
 
 function wrapToWidth(text, size, maxWidth) {
-  const words = String(text || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean)
-  if (!words.length) return [""]
+  const paragraphs = String(text || "").replace(/\r\n/g, "\n").split("\n")
   const lines = []
-  let line = ""
-  for (const word of words) {
-    for (const piece of chunksForWidth(word, size, maxWidth)) {
-      const next = line ? `${line} ${piece}` : piece
-      if (textWidth(next, size) <= maxWidth) line = next
-      else {
-        if (line) lines.push(line)
-        line = piece
+  for (const paragraph of paragraphs) {
+    const words = paragraph.replace(/[ \t]+/g, " ").trim().split(" ").filter(Boolean)
+    if (!words.length) continue
+    let line = ""
+    for (const word of words) {
+      for (const piece of chunksForWidth(word, size, maxWidth)) {
+        const next = line ? `${line} ${piece}` : piece
+        if (textWidth(next, size) <= maxWidth) line = next
+        else {
+          if (line) lines.push(line)
+          line = piece
+        }
       }
     }
+    if (line) lines.push(line)
   }
-  if (line) lines.push(line)
   return lines.length ? lines : [""]
+}
+
+function wrapPieces(pieces, size, maxWidth) {
+  const tokens = []
+  for (const piece of pieces || []) {
+    const parts = String(piece?.text || "").split(/(\s+)/).filter((part) => part !== "")
+    for (const part of parts) {
+      if (/^\s+$/.test(part)) tokens.push({ space: true, link: piece.link || null })
+      else for (const chunk of chunksForWidth(part, size, maxWidth)) tokens.push({ text: chunk, link: piece.link || null })
+    }
+  }
+  const lines = []
+  let runs = []
+  let width = 0
+  const flush = () => {
+    while (runs[0]?.text === " ") runs.shift()
+    while (runs.at(-1)?.text === " ") runs.pop()
+    if (runs.length) lines.push(runs)
+    runs = []
+    width = 0
+  }
+  for (const token of tokens) {
+    if (token.space) {
+      if (!runs.length) continue
+      const spaceWidth = textWidth(" ", size)
+      if (width + spaceWidth > maxWidth) {
+        flush()
+        continue
+      }
+      runs.push({ text: " ", link: token.link || null })
+      width += spaceWidth
+      continue
+    }
+    const wordWidth = textWidth(token.text, size)
+    if (runs.length && width + wordWidth > maxWidth) flush()
+    runs.push({ text: token.text, link: token.link })
+    width += wordWidth
+  }
+  flush()
+  return lines
 }
 
 function layoutContents(entries, bookTitle) {
@@ -412,10 +528,9 @@ function layoutContents(entries, bookTitle) {
     text: "Contents",
     font: "F2",
     size: 20,
-    color: "0.55 0.09 0.11",
+    color: "0.18 0.22 0.28",
     x: MARGIN,
     highlight: true,
-    rule: true,
     gapBefore: 4,
   })
   if (bookTitle) {
@@ -433,7 +548,7 @@ function layoutContents(entries, bookTitle) {
       text: String(index + 1),
       font: "F2",
       size,
-      color: "0.55 0.09 0.11",
+      color: "0.35 0.42 0.50",
       x: MARGIN,
       gapBefore: index === 0 ? 0 : 4,
       destPage: entry.page,
@@ -517,12 +632,14 @@ function pdfEscape(value) {
   return out
 }
 
+const LINK_BLUE = "0.12 0.35 0.62"
+
 function pdfNum(value) {
   return Number(value || 0).toFixed(2)
 }
 
-function paintSheet(lines, label, pageNumber) {
-  const commands = ["0.85 0.85 0.85 RG", "0.6 w", `${MARGIN} ${PAGE_HEIGHT - 36} m ${PAGE_WIDTH - MARGIN} ${PAGE_HEIGHT - 36} l S`]
+function paintSheet(lines, label, pageNumber, cover = false) {
+  const commands = cover ? [] : ["0.85 0.85 0.85 RG", "0.6 w", `${MARGIN} ${PAGE_HEIGHT - 36} m ${PAGE_WIDTH - MARGIN} ${PAGE_HEIGHT - 36} l S`]
   for (const line of lines) {
     if (line.image && line.name) {
       commands.push("q")
@@ -558,15 +675,64 @@ function paintSheet(lines, label, pageNumber) {
     }
     if (!line.text) continue
     if (line.highlight) {
-      commands.push("0.98 0.93 0.92 rg")
+      commands.push("0.93 0.94 0.95 rg")
       commands.push(`${MARGIN - 8} ${line.y - 5} ${PAGE_WIDTH - MARGIN * 2 + 16} ${line.size + 10} re f`)
     }
-    commands.push("BT")
-    commands.push(`${line.color} rg`)
-    commands.push(`/${line.font} ${line.size} Tf`)
-    commands.push(`1 0 0 1 ${line.x} ${line.y} Tm`)
-    commands.push(`(${pdfEscape(line.text)}) Tj`)
-    commands.push("ET")
+    const linkedRuns = (line.runs || []).some((run) => run.link && run.text.trim())
+    if (linkedRuns) {
+      let cursor = line.x
+      let span = null
+      const paintSpan = () => {
+        if (!span) return
+        commands.push("BT")
+        commands.push(`${LINK_BLUE} rg`)
+        commands.push(`/${line.font} ${line.size} Tf`)
+        commands.push(`1 0 0 1 ${pdfNum(span.x)} ${pdfNum(line.y)} Tm`)
+        commands.push(`(${pdfEscape(span.text)}) Tj`)
+        commands.push("ET")
+        commands.push(`${LINK_BLUE} RG`)
+        commands.push("0.6 w")
+        commands.push(`${pdfNum(span.x)} ${pdfNum(line.y - 1.5)} m ${pdfNum(span.x + span.w)} ${pdfNum(line.y - 1.5)} l S`)
+        span = null
+      }
+      for (const run of line.runs) {
+        const width = textWidth(run.text, line.size)
+        if (run.link) {
+          const same = span && JSON.stringify(span.link) === JSON.stringify(run.link)
+          if (same) {
+            span.text += run.text
+            span.w += width
+          } else {
+            paintSpan()
+            span = { x: cursor, w: width, text: run.text, link: run.link }
+          }
+        } else {
+          paintSpan()
+          commands.push("BT")
+          commands.push(`${line.color} rg`)
+          commands.push(`/${line.font} ${line.size} Tf`)
+          commands.push(`1 0 0 1 ${pdfNum(cursor)} ${pdfNum(line.y)} Tm`)
+          commands.push(`(${pdfEscape(run.text)}) Tj`)
+          commands.push("ET")
+        }
+        cursor += width
+      }
+      paintSpan()
+    } else {
+      const linkedLine = Boolean(line.destPage)
+      commands.push("BT")
+      commands.push(`${linkedLine ? LINK_BLUE : line.color} rg`)
+      commands.push(`/${line.font} ${line.size} Tf`)
+      commands.push(`1 0 0 1 ${line.x} ${line.y} Tm`)
+      commands.push(`(${pdfEscape(line.text)}) Tj`)
+      commands.push("ET")
+      if (linkedLine) {
+        const width = textWidth(line.text, line.size)
+        commands.push(`${LINK_BLUE} RG`)
+        commands.push("0.6 w")
+        commands.push(`${pdfNum(line.x)} ${pdfNum(line.y - 1.5)} m ${pdfNum(line.x + width)} ${pdfNum(line.y - 1.5)} l S`)
+      }
+    }
     if (line.leader && line.leader.to - line.leader.from > 6) {
       commands.push("0.65 0.65 0.65 RG")
       commands.push("1 J")
@@ -590,6 +756,7 @@ function paintSheet(lines, label, pageNumber) {
       commands.push(`${line.x} ${line.y - 5} m ${line.x + 84} ${line.y - 5} l S`)
     }
   }
+  if (!cover) {
   commands.push("BT")
   commands.push("0.4 0.4 0.4 rg")
   commands.push("/F1 9 Tf")
@@ -604,45 +771,91 @@ function paintSheet(lines, label, pageNumber) {
   commands.push(`1 0 0 1 ${pageX} 32 Tm`)
   commands.push(`(${pageLabel}) Tj`)
   commands.push("ET")
+  }
   return commands.join("\n")
 }
 
-function tocAnnotations(lines, rendered) {
+function layoutCover(cover) {
+  if (!cover?.jpeg?.length || !cover.pixelWidth || !cover.pixelHeight) return []
+  const maxW = PAGE_WIDTH - 36
+  const maxH = PAGE_HEIGHT - 36
+  const fit = Math.min(maxW / cover.pixelWidth, maxH / cover.pixelHeight)
+  const w = cover.pixelWidth * fit
+  const h = cover.pixelHeight * fit
+  return [[{
+    image: true,
+    jpeg: cover.jpeg,
+    pixelWidth: cover.pixelWidth,
+    pixelHeight: cover.pixelHeight,
+    x: (PAGE_WIDTH - w) / 2,
+    y: (PAGE_HEIGHT - h) / 2,
+    w,
+    h,
+  }]]
+}
+
+function pageAnnotations(lines, rendered, chapters) {
   const annots = []
+  const add = (rect, action) => {
+    annots.push(`<< /Type /Annot /Subtype /Link /Rect [${rect}] /Border [0 0 0] ${action} >>`)
+  }
   for (const line of lines || []) {
-    if (!line.destPage) continue
-    const target = rendered[line.destPage - 1]
-    if (!target) continue
-    const rectBottom = Math.max(0, line.y - 3)
-    const rectTop = line.y + (line.size || 11) + 3
-    annots.push(`<< /Type /Annot /Subtype /Link /Rect [${pdfNum(MARGIN - 4)} ${pdfNum(rectBottom)} ${pdfNum(PAGE_WIDTH - MARGIN + 4)} ${pdfNum(rectTop)}] /Border [0 0 0] /Dest [${target.pageId} 0 R /XYZ 0 ${PAGE_HEIGHT} null] >>`)
+    if (line.destPage) {
+      const target = rendered[line.destPage - 1]
+      if (target) {
+        add(
+          `${pdfNum(MARGIN - 4)} ${pdfNum(Math.max(0, line.y - 3))} ${pdfNum(PAGE_WIDTH - MARGIN + 4)} ${pdfNum(line.y + (line.size || 11) + 3)}`,
+          `/Dest [${target.pageId} 0 R /XYZ 0 ${PAGE_HEIGHT} null]`,
+        )
+      }
+    }
+    for (const mark of line.links || []) {
+      const rect = `${pdfNum(mark.x)} ${pdfNum(Math.max(0, line.y - 2))} ${pdfNum(mark.x + mark.w)} ${pdfNum(line.y + (line.size || 11) + 2)}`
+      if (mark.link?.type === "uri" && mark.link.href) {
+        add(rect, `/A << /S /URI /URI (${pdfEscape(mark.link.href)}) >>`)
+        continue
+      }
+      const chapter = (chapters || []).find((item) => {
+        if (mark.link?.type === "file") return item.file === mark.link.file
+        return mark.link?.type === "chapter" && item.number && item.number === mark.link.number
+      })
+      const target = chapter ? rendered[chapter.pageIndex] : null
+      if (target) add(rect, `/Dest [${target.pageId} 0 R /XYZ 0 ${PAGE_HEIGHT} null]`)
+    }
   }
   return annots.length ? ` /Annots [${annots.join(" ")}]` : ""
 }
 
-function buildBookPdf(pages, sourceTitle = "") {
+function buildBookPdf(pages, sourceTitle = "", cover = null) {
   const chapters = (pages || []).map((page) => {
     const blocks = chapterBlocks(page)
     const title = page?.heading || blocks.find((block) => block.kind === "h1")?.text || "Chapter"
-    return { title, sheets: layoutBlocks(blocks) }
+    const identity = chapterNumberFrom(page?.file, title)
+    return { title, file: identity.file, number: identity.number, sheets: layoutBlocks(blocks) }
   }).filter((chapter) => chapter.sheets.length)
-  const contentCount = chapters.reduce((sum, chapter) => sum + chapter.sheets.length, 0)
-  let entries = chapters.map((chapter, index) => ({
+  const coverSheets = layoutCover(cover)
+  const chapterEntries = (offset) => chapters.map((chapter, index) => ({
     title: chapter.title,
-    page: 2 + chapters.slice(0, index).reduce((sum, item) => sum + item.sheets.length, 0),
+    page: offset + 1 + chapters.slice(0, index).reduce((sum, item) => sum + item.sheets.length, 0),
   }))
+  let entries = [
+    ...(coverSheets.length ? [{ title: "Cover", page: 1 }] : []),
+    ...chapterEntries(coverSheets.length + 1),
+  ]
   let tocSheets = layoutContents(entries, bookLabel(sourceTitle))
   for (let pass = 0; pass < 3; pass += 1) {
-    const offset = tocSheets.length
-    entries = chapters.map((chapter, index) => ({
-      title: chapter.title,
-      page: offset + 1 + chapters.slice(0, index).reduce((sum, item) => sum + item.sheets.length, 0),
-    }))
+    const offset = coverSheets.length + tocSheets.length
+    entries = [
+      ...(coverSheets.length ? [{ title: "Cover", page: 1 }] : []),
+      ...chapterEntries(offset),
+    ]
     const next = layoutContents(entries, bookLabel(sourceTitle))
+    const previous = tocSheets.length
     tocSheets = next
-    if (next.length === offset) break
+    if (next.length === previous) break
   }
   const assembled = [
+    ...coverSheets.map((lines) => ({ lines, label: "Cover", cover: true })),
     ...tocSheets.map((lines) => ({ lines, label: "Contents" })),
     ...chapters.flatMap((chapter) => chapter.sheets.map((lines) => ({ lines, label: chapter.title }))),
   ]
@@ -667,18 +880,24 @@ function buildBookPdf(pages, sourceTitle = "") {
       bodies.set(objectId, image)
       images.push({ name: line.name, objectId })
     }
-    const stream = paintSheet(sheet.lines, sheet.label, index + 1)
+    const stream = paintSheet(sheet.lines, sheet.label, index + 1, sheet.cover)
     return { pageId, streamId, stream, images, lines: sheet.lines }
   })
   const outlineItems = []
-  let cursor = tocSheets.length
+  let cursor = coverSheets.length + tocSheets.length
   chapters.forEach((chapter) => {
+    chapter.pageIndex = cursor
     outlineItems.push({ id: nextId, title: chapter.title, pageId: rendered[cursor]?.pageId || rendered[0].pageId })
     nextId += 1
     cursor += chapter.sheets.length
   })
-  if (rendered[0]) {
-    outlineItems.unshift({ id: nextId, title: "Contents", pageId: rendered[0].pageId })
+  const contentsPage = rendered[coverSheets.length]
+  if (contentsPage) {
+    outlineItems.unshift({ id: nextId, title: "Contents", pageId: contentsPage.pageId })
+    nextId += 1
+  }
+  if (coverSheets.length && rendered[0]) {
+    outlineItems.unshift({ id: nextId, title: "Cover", pageId: rendered[0].pageId })
     nextId += 1
   }
 
@@ -691,7 +910,7 @@ function buildBookPdf(pages, sourceTitle = "") {
     const resources = xobjects
       ? `/Resources << /Font << /F1 3 0 R /F2 4 0 R >> /XObject << ${xobjects} >> >>`
       : "/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >>"
-    const annots = tocAnnotations(page.lines, rendered)
+    const annots = pageAnnotations(page.lines, rendered, chapters)
     bodies.set(
       page.pageId,
       `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}] /Contents ${page.streamId} 0 R ${resources}${annots} >>`,
@@ -911,10 +1130,9 @@ function writeExportJob(job) {
 function reportExport(job, line) {
   job.log = [...(job.log || []), line].slice(-20)
   console.info("[omniget]", line)
-  const button = document.getElementById("omniget-oreilly-pdf")
-  if (!button) return
-  button.textContent = line
-  button.title = job.log.join("\n")
+  try {
+    chrome.runtime?.sendMessage?.({ type: "omniget-oreilly-progress", line })
+  } catch { /* the popup may already be closed */ }
 }
 
 function whenChapterReady(doc) {
@@ -1009,18 +1227,55 @@ async function fetchJson(url) {
 
 async function loadChapters(isbn) {
   const chapters = []
+  const covers = []
   let url = `https://learning.oreilly.com/api/v2/epubs/urn:orm:book:${isbn}/files/?limit=500`
   while (url) {
     const payload = await fetchJson(url)
     for (const row of payload.results || []) {
+      if (!row?.url) continue
+      const filename = row.filename || ""
+      if (/^cover\./i.test(filename)) {
+        covers.push({ title: "Cover", url: row.url, filename, mediaType: row.media_type || "" })
+        continue
+      }
       if (String(row?.kind || "").toLowerCase() !== "chapter") continue
-      if (!row.url) continue
-      if (/^cover\./i.test(row.filename || "")) continue
-      chapters.push({ title: row.filename || "Chapter", url: row.url })
+      chapters.push({ title: filename || "Chapter", url: row.url })
     }
     url = payload.next || ""
   }
-  return chapters
+  const cover = covers.find((item) => /\.(jpe?g|png|webp|gif)$/i.test(item.filename)) || covers[0] || null
+  return { chapters, cover }
+}
+
+async function loadCover(cover) {
+  if (!cover?.url) return null
+  const response = await fetch(cover.url, { credentials: "include" })
+  if (!response.ok) return null
+  const contentType = response.headers.get("content-type") || ""
+  const imageFile = /\.(jpe?g|png|webp|gif)$/i.test(cover.filename || "")
+  if (/^image\//i.test(contentType) || (imageFile && !/html|xml/i.test(contentType))) {
+    return rasterizeBlob(await response.blob())
+  }
+  const parsed = textFromChapterHtml(await response.text())
+  const figures = (parsed.blocks || []).filter((block) => (block.kind === "img" && block.src) || (block.kind === "svg" && block.markup))
+  for (const figure of figures) {
+    const loaded = await loadFigure(figure, cover.url)
+    if (loaded?.jpeg) return loaded
+  }
+  return null
+}
+
+function readableHeading(value) {
+  let text = String(value || "").replace(/\s+/g, " ").trim()
+  text = text.replace(/\.(html?|xhtml)$/i, "")
+  let previous = ""
+  while (text && previous !== text) {
+    previous = text
+    text = text.replace(/__([^_]+)__/g, "$1")
+    text = text.replace(/(^|[\s(\[])_([^_\n]+)_([\s)\].,;:!?]|$)/g, "$1$2$3")
+  }
+  if (!/\s/.test(text) && text.includes("_")) text = text.replace(/_+/g, " ")
+  return text.replace(/\s+/g, " ").trim()
 }
 
 function plainText(value, keepLines) {
@@ -1029,9 +1284,80 @@ function plainText(value, keepLines) {
   return text.replace(/\s+/g, " ").trim()
 }
 
-function pushTextBlock(blocks, kind, value) {
-  const text = plainText(value, kind === "pre")
-  if (text) blocks.push({ kind, text })
+function inlinePieces(node, mentions) {
+  const pieces = []
+  const walk = (current, link) => {
+    for (const child of current.childNodes || []) {
+      if (child.nodeType === 3) {
+        const text = String(child.textContent || "").replace(/\s+/g, " ")
+        if (text) pieces.push({ text, link })
+        continue
+      }
+      if (child.nodeType !== 1) continue
+      const tag = child.tagName.toLowerCase()
+      if (tag === "script" || tag === "style" || tag === "img" || tag === "svg" || tag === "table") continue
+      if (tag === "a") {
+        walk(child, linkFromHref(child.getAttribute("href") || "") || link)
+        continue
+      }
+      walk(child, link)
+    }
+  }
+  walk(node, null)
+  const merged = []
+  for (const piece of pieces) {
+    const last = merged[merged.length - 1]
+    const same = JSON.stringify(last?.link || null) === JSON.stringify(piece.link || null)
+    if (last && same) last.text += piece.text
+    else merged.push({ text: piece.text, link: piece.link || null })
+  }
+  return mentions ? chapterMentions(merged) : merged
+}
+
+function pushTextBlock(blocks, kind, source) {
+  const node = source && source.nodeType === 1 ? source : null
+  const mentions = kind !== "h1" && kind !== "pre"
+  let pieces = node ? inlinePieces(node, mentions) : null
+  if (pieces && /^h[1-4]$/.test(kind)) {
+    pieces = pieces.map((piece) => ({ ...piece, text: readableHeading(piece.text) })).filter((piece) => piece.text)
+  }
+  const plain = pieces
+    ? pieces.map((piece) => piece.text).join("").replace(/\s+/g, " ").trim()
+    : (/^h[1-4]$/.test(kind) ? readableHeading(plainText(source, false)) : plainText(source, kind === "pre"))
+  if (!plain) return
+  const block = { kind, text: plain }
+  if (pieces?.some((piece) => piece.text)) block.pieces = pieces
+  blocks.push(block)
+}
+
+function cellLines(cell) {
+  if (!cell) return []
+  const blocks = [...(cell.children || [])].filter((el) => /^(p|div|li|h[1-6])$/i.test(el.tagName))
+  if (blocks.length > 1) return blocks.map((block) => plainText(block.textContent)).filter(Boolean)
+  const parts = []
+  let current = ""
+  const flush = () => {
+    const text = plainText(current)
+    if (text) parts.push(text)
+    current = ""
+  }
+  const walk = (node) => {
+    for (const child of node.childNodes || []) {
+      if (child.nodeType === 3) current += child.textContent
+      else if (child.nodeType === 1) {
+        const tag = child.tagName.toLowerCase()
+        if (tag === "br") flush()
+        else if (tag === "p" || tag === "li" || tag === "div") {
+          flush()
+          const text = plainText(child.textContent)
+          if (text) parts.push(text)
+        } else walk(child)
+      }
+    }
+  }
+  walk(cell)
+  flush()
+  return parts.length ? parts : [plainText(cell.textContent)].filter(Boolean)
 }
 
 function tableRows(table) {
@@ -1045,7 +1371,7 @@ function tableRows(table) {
         const name = cell.tagName.toLowerCase()
         return name === "td" || name === "th"
       })
-      if (cells.length) rows.push(cells.map((cell) => plainText(cell.textContent)))
+      if (cells.length) rows.push(cells.map((cell) => cellLines(cell).join("\n")))
     }
   }
   return rows
@@ -1064,13 +1390,13 @@ function absorb(node, blocks) {
   if (tag === "script" || tag === "style" || tag === "noscript" || tag === "nav") return
   if (tag === "table") {
     const rows = tableRows(node)
-    const caption = plainText(node.querySelector("caption")?.textContent)
+    const caption = cellLines(node.querySelector("caption")).join("\n")
     if (rows.length) blocks.push({ kind: "table", caption, rows, header: Boolean(node.querySelector("th")) })
     for (const img of node.querySelectorAll("img, svg")) absorb(img, blocks)
     return
   }
   if (tag === "figure" || node.getAttribute("data-type") === "figure") {
-    const caption = plainText(node.querySelector("figcaption")?.textContent)
+    const caption = cellLines(node.querySelector("figcaption")).join(" ")
     const img = node.querySelector("img")
     const svg = node.querySelector("svg")
     const table = node.querySelector("table")
@@ -1078,7 +1404,7 @@ function absorb(node, blocks) {
     else if (svg) blocks.push({ kind: "svg", markup: svg.outerHTML, caption })
     else if (table) {
       const rows = tableRows(table)
-      if (rows.length) blocks.push({ kind: "table", caption: caption || plainText(table.querySelector("caption")?.textContent), rows, header: Boolean(table.querySelector("th")) })
+      if (rows.length) blocks.push({ kind: "table", caption: caption || cellLines(table.querySelector("caption")).join("\n"), rows, header: Boolean(table.querySelector("th")) })
       for (const img of node.querySelectorAll("img, svg")) absorb(img, blocks)
     }
     return
@@ -1106,7 +1432,7 @@ function absorb(node, blocks) {
     return
   }
   if (/^h[1-4]$/.test(tag)) {
-    pushTextBlock(blocks, tag, node.textContent)
+    pushTextBlock(blocks, tag, node)
     return
   }
   if (tag === "pre") {
@@ -1115,32 +1441,37 @@ function absorb(node, blocks) {
   }
   if (tag === "blockquote") {
     if (node.querySelector("table, img, svg, figure")) [...node.children].forEach((child) => absorb(child, blocks))
-    else pushTextBlock(blocks, "quote", node.textContent)
+    else pushTextBlock(blocks, "quote", node)
     return
   }
   if (tag === "li") {
     if (node.querySelector("table, img, svg, figure")) [...node.children].forEach((child) => absorb(child, blocks))
     else if (node.querySelector("p")) [...node.children].forEach((child) => {
-      if (child.tagName?.toLowerCase() === "p") pushTextBlock(blocks, "li", child.textContent)
+      if (child.tagName?.toLowerCase() === "p") pushTextBlock(blocks, "li", child)
     })
-    else pushTextBlock(blocks, "li", node.textContent)
+    else pushTextBlock(blocks, "li", node)
     return
   }
   if (tag === "p") {
     if (!node.querySelector("img, svg")) {
-      pushTextBlock(blocks, "p", node.textContent)
+      pushTextBlock(blocks, "p", node)
       return
     }
-    let pending = ""
-    for (const child of node.childNodes) {
-      if (child.nodeType === 3) pending += child.textContent
-      else if (child.nodeType === 1 && /^(img|svg)$/i.test(child.tagName)) {
-        pushTextBlock(blocks, "p", pending)
-        pending = ""
-        absorb(child, blocks)
-      } else if (child.nodeType === 1) pending += child.textContent
+    let group = []
+    const flush = () => {
+      if (!group.length) return
+      const span = node.ownerDocument.createElement("span")
+      for (const child of group) span.appendChild(child.cloneNode(true))
+      pushTextBlock(blocks, "p", span)
+      group = []
     }
-    pushTextBlock(blocks, "p", pending)
+    for (const child of node.childNodes) {
+      if (child.nodeType === 1 && /^(img|svg)$/i.test(child.tagName)) {
+        flush()
+        absorb(child, blocks)
+      } else group.push(child)
+    }
+    flush()
     return
   }
   ;[...node.children].forEach((child) => absorb(child, blocks))
@@ -1261,9 +1592,15 @@ async function exportWholeBook(doc) {
     const isbn = bookIsbn(location.href)
     if (!isbn) throw new Error("This page has no book id")
     reportExport(job, "Reading the chapter list")
-    const chapters = await loadChapters(isbn)
+    const listed = await loadChapters(isbn)
+    const chapters = listed.chapters || []
     if (!chapters.length) throw new Error("The chapter list was empty")
     reportExport(job, `Found ${chapters.length} chapters`)
+    let cover = null
+    if (listed.cover) {
+      reportExport(job, "Reading the cover")
+      cover = await loadCover(listed.cover)
+    }
     const pages = []
     for (let index = 0; index < chapters.length; index += 1) {
       const chapter = chapters[index]
@@ -1274,7 +1611,7 @@ async function exportWholeBook(doc) {
         continue
       }
       const parsed = textFromChapterHtml(await response.text())
-      const heading = parsed.heading || String(chapter.title || "Chapter").replace(/\.[^.]+$/, "")
+      const heading = readableHeading(parsed.heading || String(chapter.title || "Chapter").replace(/\.[^.]+$/, ""))
       const blocks = parsed.blocks?.length ? parsed.blocks : []
       if (!blocks.some((block) => block.kind === "h1")) blocks.unshift({ kind: "h1", text: heading })
       const figures = blocks.filter((block) => (block.kind === "img" && block.src) || (block.kind === "svg" && block.markup))
@@ -1293,13 +1630,13 @@ async function exportWholeBook(doc) {
       }
       const keep = blocks.some((block) => block.kind !== "h1" && (block.text || block.rows?.length || block.jpeg))
       if (!keep) continue
-      pages.push({ heading, blocks })
+      pages.push({ heading, blocks, file: chapter.title })
     }
     if (!pages.length) throw new Error("No chapter text came back")
     const figureCount = pages.reduce((sum, page) => sum + page.blocks.filter((block) => block.jpeg).length, 0)
     const tableCount = pages.reduce((sum, page) => sum + page.blocks.filter((block) => block.kind === "table").length, 0)
     reportExport(job, `Saving ${pages.length} chapters, ${tableCount} tables, ${figureCount} figures`)
-    downloadPdf(buildBookPdf(pages, doc.title), bookFileName(doc.title, pages[0].heading))
+    downloadPdf(buildBookPdf(pages, doc.title, cover), bookFileName(doc.title, pages[0].heading))
     reportExport(job, "Saved")
   } catch (error) {
     console.error("[omniget]", error)
@@ -1336,58 +1673,19 @@ function downloadPdf(bytes, filename) {
   URL.revokeObjectURL(url)
 }
 
-function mountExportButton(doc = globalThis.document) {
-  if (!doc?.body || doc.getElementById("omniget-oreilly-pdf")) return
-  if (!isOReillyHost(globalThis.location?.hostname)) return
-
-  const button = doc.createElement("button")
-  button.id = "omniget-oreilly-pdf"
-  button.type = "button"
-  button.textContent = "Save one PDF"
-  button.style.cssText = [
-    "position:fixed",
-    "top:72px",
-    "left:50%",
-    "transform:translateX(-50%)",
-    "z-index:2147483646",
-    "padding:8px 12px",
-    "border:0",
-    "border-radius:4px",
-    "background:#d32f2f",
-    "color:#fff",
-    "font:600 13px sans-serif",
-    "cursor:pointer",
-  ].join(";")
-
-  button.addEventListener("click", () => exportWholeBook(doc))
-
-  const host = doc.documentElement || doc.body
-  host.appendChild(button)
-}
-
-function watchExportButton() {
-  const mount = () => mountExportButton()
-  mount()
-  if (!isOReillyHost(location.hostname) || !document.documentElement) return
-  const observer = new MutationObserver(() => mount())
-  observer.observe(document.documentElement, { childList: true, subtree: true })
-}
-
 if (typeof document !== "undefined" && document.documentElement) {
   document.getElementById("omniget-oreilly-pdf")?.remove()
-  watchExportButton()
-  try { sessionStorage.removeItem(EXPORT_JOB_KEY) } catch { /* keep the button */ }
+  try { sessionStorage.removeItem(EXPORT_JOB_KEY) } catch { /* the saver still runs from the popup */ }
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime?.onMessage) {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type !== "omniget-oreilly-export") return
-    const button = document.getElementById("omniget-oreilly-pdf")
-    if (!button) {
-      sendResponse({ ok: false, reason: "no-button" })
+    if (typeof exportWholeBook !== "function") {
+      sendResponse({ ok: false, reason: "The book page did not load the saver." })
       return
     }
-    button.click()
+    exportWholeBook(document)
     sendResponse({ ok: true })
   })
 }

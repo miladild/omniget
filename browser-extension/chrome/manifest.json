@@ -78,7 +78,11 @@
     "*://*.soundcloud.com/*",
     "*://*.sndcdn.com/*",
     "*://*.oreilly.com/*",
-    "*://*.oreillystatic.com/*"
+    "*://*.oreillystatic.com/*",
+    "*://*.kaltura.com/*",
+    "*://kaltura.com/*",
+    "*://libbyapp.com/*",
+    "*://*.libbyapp.com/*"
   ],
   "optional_host_permissions": [
     "*://*/*"

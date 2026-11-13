@@ -1,5 +1,5 @@
 import { loadOpenAppState, isOpenAppEnabled, setOpenAppEnabled } from "../src/open-app-toggle.js";
-import { getHlsGroupKey } from "../src/hls-grouping.js";
+import { describedFileName, describedMediaPath, getHlsGroupKey, getStatedQuality, isCaptionMedia, isStreamingFragment } from "../src/hls-grouping.js";
 import { normalizePageKey } from "../src/sniffer-storage.js";
 import { formatCookieSummary } from "../src/cookie-summary.js";
 import { extractSendableHeaders } from "../src/header-allowlist.js";
@@ -64,7 +64,8 @@ async function init() {
   } catch {}
 
   initCookieCapture(activeTab);
-  initOReillyExport(activeTab);
+  if (isLibbyHost(hostnameOf(activeTab))) initLibbyExport(activeTab);
+  else initOReillyExport(activeTab);
 
   const h264Toggle = document.getElementById("h264-toggle");
   chrome.runtime.sendMessage({ type: "getH264" }, (r) => { if (r && h264Toggle) h264Toggle.checked = r.enabled; });
@@ -183,9 +184,7 @@ function renderMediaDetected(container) {
 
   const hlsGroups = groupHlsManifests(media);
   const groups = [...hlsGroups.values()].filter(g => g.master);
-  const nonHls = media.filter(m => m.mediaType !== "hls").filter(isListableMedia);
-  const totalVideos = groups.length
-    + nonHls.filter(m => m.mediaType === "video" || m.mediaType === "dash").length;
+  const totalVideos = countDistinctVideos(media, groups);
 
   const domain = getDomainFromUrl(currentData.tabUrl || best.url);
   const title = pageTitle ? truncate(pageTitle, 40) : domain;
@@ -241,8 +240,8 @@ function appendPrimaryButton(container, label, meta, onClick) {
 function appendMediaControls(container, media) {
   const hlsGroups = groupHlsManifests(media);
   const groups = [...hlsGroups.values()].filter(g => g.master);
-  const nonHls = (media || []).filter(m => m.mediaType !== "hls").filter(isListableMedia);
-  const directMedia = deduplicateMedia(nonHls).slice(0, 10);
+  const nonHls = (media || []).filter(m => m.mediaType !== "hls" && !isStreamingFragment(m.url)).filter(isListableMedia);
+  const directMedia = deduplicateMedia(bestCopyByGroup(nonHls)).slice(0, 10);
   const totalItems = groups.length + directMedia.length;
 
   if (groups.length >= 2) {
@@ -527,13 +526,23 @@ async function sendBatch(groups) {
   return { sent, failed, ok: failed === 0 };
 }
 
+function hlsMasterRank(url) {
+  const path = describedMediaPath(url) || String(url || "");
+  const name = describedFileName(url);
+  if (/flavorIds\/[^/?]*,/i.test(path)) return 3;
+  if (/playManifest/i.test(path) && !/\/flavorId\//i.test(path)) return 2;
+  if (name === "master.m3u8" || name === "playlist.m3u8" || name === "index.m3u8") return 1;
+  return 0;
+}
+
 function groupHlsManifests(media) {
   const hlsItems = (media || []).filter(m => m.mediaType === "hls");
   const groups = new Map();
 
   for (const item of hlsItems) {
     const filename = getFilenameFromUrl(item.url).toLowerCase();
-    if (filename.includes("subtitle") || filename.includes("caption")) continue;
+    if (filename.includes("subtitle") || filename.includes("caption") || isCaptionMedia(item.url)) continue;
+    if (isStreamingFragment(item.url)) continue;
 
     const key = getHlsGroupKey(item.url);
     if (!groups.has(key)) groups.set(key, { master: null, variants: [], all: [] });
@@ -541,9 +550,7 @@ function groupHlsManifests(media) {
     const group = groups.get(key);
     group.all.push(item);
 
-    if (filename.includes("master") || filename.includes("playlist") || filename === "index.m3u8") {
-      group.master = item;
-    } else if (!group.master) {
+    if (!group.master || preferStream(group.master, item)) {
       group.master = item;
     }
   }
@@ -571,9 +578,9 @@ function pickBestMedia(media) {
     if (bestGroup?.master) return bestGroup.master;
   }
 
-  const videoItems = media.filter(m => m.mediaType === "video" && isListableMedia(m));
+  const videoItems = media.filter(m => m.mediaType === "video" && isListableMedia(m) && !isStreamingFragment(m.url));
   if (videoItems.length > 0) {
-    return videoItems.reduce((best, m) => m.contentLength > best.contentLength ? m : best, videoItems[0]);
+    return videoItems.reduce((best, m) => (preferCopy(best, m) ? m : best), videoItems[0]);
   }
 
   // A DASH manifest carries no useful size, so it can only be picked by recency
@@ -601,6 +608,45 @@ function getDownloadLabel(contentType) {
     case "profile": return tr("popup_lbl_profile");
     default: return tr("popup_lbl_page");
   }
+}
+
+function countDistinctVideos(media, groups) {
+  const hlsKeys = new Set((groups || []).map((group) => getHlsGroupKey(group.master.url)));
+  const directKeys = new Set();
+  for (const item of media || []) {
+    if (item.mediaType === "hls" || isStreamingFragment(item.url) || !isListableMedia(item)) continue;
+    if (item.mediaType !== "video" && item.mediaType !== "dash") continue;
+    const key = getHlsGroupKey(item.url);
+    if (!hlsKeys.has(key)) directKeys.add(key);
+  }
+  return hlsKeys.size + directKeys.size;
+}
+
+function preferStream(current, candidate) {
+  const currentQuality = getStatedQuality(current?.url);
+  const candidateQuality = getStatedQuality(candidate?.url);
+  if (candidateQuality !== currentQuality) return candidateQuality > currentQuality;
+  const currentRank = hlsMasterRank(current?.url);
+  const candidateRank = hlsMasterRank(candidate?.url);
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
+  return (candidate?.contentLength || 0) > (current?.contentLength || 0);
+}
+
+function preferCopy(current, candidate) {
+  const currentQuality = getStatedQuality(current?.url);
+  const candidateQuality = getStatedQuality(candidate?.url);
+  if (candidateQuality !== currentQuality) return candidateQuality > currentQuality;
+  return (candidate?.contentLength || 0) > (current?.contentLength || 0);
+}
+
+function bestCopyByGroup(media) {
+  const best = new Map();
+  for (const item of media || []) {
+    const key = `${item.mediaType}|${getHlsGroupKey(item.url)}`;
+    const current = best.get(key);
+    if (!current || preferCopy(current, item)) best.set(key, item);
+  }
+  return [...best.values()].sort((a, b) => (b.contentLength || 0) - (a.contentLength || 0));
 }
 
 function deduplicateMedia(media) {
@@ -639,8 +685,89 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+function hostnameOf(tab) {
+  try { return new URL(tab?.url || "").hostname; } catch { return ""; }
+}
+
+function isLibbyHost(hostname) {
+  return /(^|\.)libbyapp\.com$/i.test(hostname || "");
+}
+
 function isOReillyHost(hostname) {
   return /(^|\.)oreilly\.com$/i.test(hostname || "") || /(^|\.)oreillystatic\.com$/i.test(hostname || "");
+}
+
+function initLibbyExport(activeTab) {
+  const wrap = document.getElementById("oreilly-export");
+  const btn = document.getElementById("oreilly-export-btn");
+  const label = document.getElementById("oreilly-export-label");
+  const hint = document.getElementById("oreilly-export-hint");
+  if (!wrap || !btn || !label) return;
+  wrap.dataset.state = "shown";
+  if (hint) hint.textContent = "Turns the pages of the open Libby book and saves one PDF.";
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type !== "omniget-libby-progress" || !message.line) return;
+    label.textContent = String(message.line).slice(0, 80);
+  });
+
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    label.textContent = "Saving…";
+    btn.removeAttribute("data-state");
+    try {
+      const hosts = await chrome.scripting.executeScript({
+        target: { tabId: activeTab.id, allFrames: true },
+        world: "MAIN",
+        func: () => location.hostname,
+      });
+      const readers = (hosts || []).filter((item) => /^dewey-[^.]+\.read\.libbyapp\.com$/i.test(item?.result || ""));
+      if (!readers.length) throw new Error("Open the Libby book first.");
+      const frameTarget = { tabId: activeTab.id, frameIds: readers.map((item) => item.frameId) };
+      await chrome.scripting.executeScript({ target: frameTarget, files: ["src/libby-export.js"] });
+      await chrome.scripting.executeScript({ target: frameTarget, world: "MAIN", files: ["src/libby-export.js"] });
+      const probed = await chrome.scripting.executeScript({
+        target: frameTarget,
+        world: "MAIN",
+        func: () => {
+          const html = document.documentElement?.innerHTML || "";
+          return {
+            live: typeof pageBook === "function" && !!pageBook(window),
+            ready: typeof exportLibbyBook === "function",
+            markers: /bdata|edata|__bif_cfc1|odread/i.test(html),
+            footer: /pp?\.\s*\d+[\s\S]{0,8000}?of\s+\d+/i.test(document.body?.innerText || document.body?.textContent || ""),
+            len: html.length,
+          };
+        },
+      });
+      const score = (item) => (item?.result?.footer ? 8 : 0) + (item?.result?.live ? 4 : 0) + (item?.result?.markers ? 2 : 0) + (item?.result?.ready ? 1 : 0);
+      const frame = (probed || []).slice().sort((a, b) => score(b) - score(a))[0];
+      if (!frame?.result?.ready) {
+        const note = frame?.error || JSON.stringify(frame?.result || null);
+        throw new Error(`Open the Libby book first. ${note}`.slice(0, 180));
+      }
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId: activeTab.id, frameIds: [frame.frameId] },
+        world: "MAIN",
+        func: () => {
+          if (typeof exportLibbyBook !== "function") return { ok: false, skip: true };
+          return exportLibbyBook(document);
+        },
+      });
+      const saved = injected?.result?.ok ? injected.result : null;
+      const failed = injected?.result?.reason ? injected.result : null;
+      if (!saved) throw new Error(failed?.reason || "Open the Libby book first.");
+      label.textContent = "PDF downloaded";
+      if (hint) hint.textContent = "The PDF downloads from the Libby book tab.";
+    } catch (error) {
+      const message = error?.message || "The Libby book did not start."
+      label.textContent = message.slice(0, 80)
+      if (hint) hint.textContent = message
+      btn.dataset.state = "error"
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
 
 function initOReillyExport(activeTab) {
@@ -655,6 +782,11 @@ function initOReillyExport(activeTab) {
   const onBook = isOReillyHost(host);
   wrap.dataset.state = "shown";
   if (!onBook && hint) hint.textContent = "Switch to the O'Reilly book tab, then click this.";
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type !== "omniget-oreilly-progress" || !message.line) return;
+    label.textContent = String(message.line).slice(0, 80);
+  });
 
   btn.addEventListener("click", async () => {
     if (!onBook) {
@@ -673,15 +805,16 @@ function initOReillyExport(activeTab) {
       const [injected] = await chrome.scripting.executeScript({
         target: { tabId: activeTab.id },
         func: () => {
-          const button = document.getElementById("omniget-oreilly-pdf");
-          if (!button) return { ok: false, reason: "The book page did not add the button." };
-          button.click();
+          if (typeof exportWholeBook !== "function") {
+            return { ok: false, reason: "The book page did not load the saver." };
+          }
+          exportWholeBook(document);
           return { ok: true };
         },
       });
       if (!injected?.result?.ok) throw new Error(injected?.result?.reason || "The book page did not start.");
-      label.textContent = "Saving on the book page";
-      if (hint) hint.textContent = "Keep this tab open until the PDF downloads.";
+      label.textContent = "Saving the book";
+      if (hint) hint.textContent = "Keep this popup open to watch progress. The PDF downloads from the book tab.";
     } catch (error) {
       label.textContent = "Could not start";
       if (hint) hint.textContent = error?.message || "The book page did not start.";

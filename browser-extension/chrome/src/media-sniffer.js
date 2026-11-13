@@ -20,6 +20,7 @@ const BLOCKED_PATH_PATTERNS = [
 ];
 
 import { formatBytes } from "./format-size.js";
+import { isStreamingFragment } from "./hls-grouping.js";
 import { isDashManifest, isHlsManifest } from "./sniffer-filters.js";
 import { isSnifferEnabled, loadSnifferState } from "./sniffer-toggle.js";
 import { applyRegexRules, evaluateCapture } from "./capture-rules.js";
@@ -167,6 +168,7 @@ function isHlsSegment(url, contentType) {
     if (path.match(/\/segment\d+/)) return true;
     if (path.match(/\/chunk-/)) return true;
     if (path.match(/\/media_\d+/)) return true;
+    if (isStreamingFragment(url)) return true;
     if (path.endsWith(".ts") && !path.endsWith(".m3u8.ts")) {
       const parts = path.split("/");
       const filename = parts[parts.length - 1];
