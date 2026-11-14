@@ -614,7 +614,7 @@ function layoutChapters(chapters, options = {}) {
     const level = block.kind === "h" ? Number(block.level) || 2 : 0
     if (level === 1 && sheet.prose) breakPage()
     const nextStyle = next && next.kind !== "image" ? blockStyle(next) : null
-    const keep = level > 0 ? style.leading + (style.after || 0) + (nextStyle ? nextStyle.leading * 2 : 72) : 0
+    const keep = level > 0 ? (style.mark && sheet.prose ? 10 : 0) + style.leading + (style.after || 0) + (nextStyle ? nextStyle.leading * 4 + 12 : 96) : 0
     if (keep && sheet.ops.length && keep < pageRoom && sheet.y - keep < bottom) breakPage()
     if ((block.kind === "quote") && lines.length > 1 && lines.length <= 12) {
       const blockHeight = lines.length * style.leading + (style.before || 0)
@@ -697,9 +697,9 @@ function layoutChapters(chapters, options = {}) {
 function layoutContents(chapters, starts, offset, bookName) {
   const sheets = []
   const contentWidth = PAGE_WIDTH - MARGIN * 2
-  const bottom = MARGIN
+  const bottom = MARGIN + 36
   const size = 11
-  const leading = 16
+  const leading = 18
   const running = bookName || "Contents"
   let sheet = null
   const fresh = () => {
@@ -743,7 +743,7 @@ function layoutContents(chapters, starts, offset, bookName) {
       sheet.links.push({ y: baseline - 3, h: leading, dest: (starts[index] ?? 0) + offset })
       sheet.y -= leading
     })
-    sheet.y -= 6
+    sheet.y -= 14
   })
   return sheets
 }
@@ -1301,87 +1301,37 @@ function spreadPainted(doc) {
 }
 
 async function waitForTurn(doc, previous) {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    await sleep(100)
-    const marker = pageMarker(doc)
-    if (marker && marker.label !== previous) return marker
-  }
-  return pageMarker(doc)
-}
-
-function spreadBusy(doc) {
-  const limit = (doc.defaultView?.innerHeight || 800) * 0.78
-  let spinner = false
-  let pending = false
-  const walk = (root) => {
-    if (!root?.querySelectorAll) return
-    for (const el of root.querySelectorAll("img")) {
-      const box = el.getBoundingClientRect?.()
-      if (!box || box.bottom < 40 || box.top > limit || box.width < 16 || box.height < 16) continue
-      if (box.width <= 140 && box.height <= 140) spinner = true
-      else if (!el.complete || !el.naturalWidth) pending = true
-    }
-    for (const frame of root.querySelectorAll("iframe")) {
-      try { if (frame.contentDocument) walk(frame.contentDocument) } catch { /* another origin */ }
-    }
-  }
-  walk(doc)
-  return { spinner, pending }
-}
-
-async function settleSpread(doc, previous) {
-  let marker = null
-  let sample = ""
-  let steady = 0
-  let held = ""
-  let heldFor = 0
-  let pendingFor = 0
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await sleep(200)
+  let marker = pageMarker(doc)
+  for (let attempt = 0; attempt < 12 && (!marker || marker.label === previous); attempt += 1) {
+    await sleep(40)
     marker = pageMarker(doc)
-    const label = marker?.label || ""
-    if (previous && label === previous) {
-      sample = ""
-      steady = 0
-      held = ""
-      heldFor = 0
-      pendingFor = 0
-      continue
-    }
-    if (label && label === held) heldFor += 1
-    else {
-      held = label
-      heldFor = label ? 1 : 0
-      sample = ""
-      steady = 0
-    }
-    const busy = spreadBusy(doc)
-    pendingFor = busy.pending ? pendingFor + 1 : 0
-    const painted = spreadPainted(doc)
-    const quiet = !busy.spinner && (!busy.pending || pendingFor >= 8)
-    if (painted && painted === sample && heldFor >= 3 && quiet) {
-      steady += 1
-      if (steady >= 2) return marker
-    } else {
-      sample = painted
-      steady = painted ? 1 : 0
-    }
   }
-  return pageMarker(doc)
+  return marker
+}
+
+async function waitForSpread(doc, previous, previousPaint) {
+  let marker = pageMarker(doc)
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const turned = marker && (!previous || marker.label !== previous)
+    if (turned && (spreadPainted(doc) !== previousPaint || attempt >= 3)) return marker
+    await sleep(40)
+    marker = pageMarker(doc)
+  }
+  return marker
 }
 
 async function blocksForSpread(doc) {
   const blocks = []
   for (const page of spreadPages(doc)) blocks.push(...blocksFromHtml(page.html, page.url))
-  for (const block of blocks) {
-    if (block.kind !== "image" || !block.src || block.jpeg) continue
+  await Promise.all(blocks.map(async (block) => {
+    if (block.kind !== "image" || !block.src || block.jpeg) return
     try {
-      const imageResponse = await fetchWithin(block.src, 8000, { credentials: "include" })
-      if (!imageResponse.ok) continue
-      const image = await jpegBlock(await within(() => imageResponse.blob(), 8000))
+      const imageResponse = await fetchWithin(block.src, 1200, { credentials: "include" })
+      if (!imageResponse.ok) return
+      const image = await jpegBlock(await within(() => imageResponse.blob(), 1200))
       if (image) Object.assign(block, image)
     } catch { /* a missing picture should not stop the book */ }
-  }
+  }))
   return blocks
 }
 
@@ -1403,8 +1353,8 @@ async function readRenderedBook(doc) {
   }
   const chapters = []
   const seen = new Set()
-  for (let guard = 0; guard < 500; guard += 1) {
-    marker = await settleSpread(doc, "") || pageMarker(doc) || marker
+  for (let guard = 0; guard < 900; guard += 1) {
+    marker = pageMarker(doc) || marker
     if (!marker) break
     if (seen.has(marker.label)) break
     seen.add(marker.label)
@@ -1417,8 +1367,9 @@ async function readRenderedBook(doc) {
     if (marker.end >= marker.total) break
     const before = marker.label
     const floor = marker.end
+    const paintedBefore = spreadPainted(doc)
     if (!turnSpread(doc, 1)) break
-    const moved = await settleSpread(doc, before)
+    const moved = await waitForSpread(doc, before, paintedBefore)
     if (!moved || moved.label === before || moved.start <= floor) break
     marker = moved
   }
@@ -1433,7 +1384,9 @@ async function saveLibbyBook(doc) {
   const title = openbook ? bookTitle(openbook) : (doc.title || "Libby book")
   const chapters = await readRenderedBook(doc)
   reportLibby("Making the PDF")
+  await sleep(0)
   const pdf = buildLibbyPdf(chapters, title)
+  await sleep(0)
   const blob = new Blob([pdf], { type: "application/pdf" })
   const url = URL.createObjectURL(blob)
   const link = doc.createElement("a")

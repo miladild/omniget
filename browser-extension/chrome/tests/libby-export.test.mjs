@@ -174,6 +174,36 @@ test("spaces paragraphs and opens the next topic like a chapter", () => {
   assert.ok(text.indexOf("(Mind)") < text.indexOf("(What psychology studies)"))
 })
 
+test("moves a heading onto the next page with the paragraph that follows it", () => {
+  const filler = "This sentence fills the page so the next heading cannot sit alone at the bottom. ".repeat(40)
+  const pdf = buildLibbyPdf([
+    {
+      title: "Mind",
+      blocks: [
+        { kind: "p", text: filler },
+        { kind: "h", level: 2, text: "The next topic" },
+        { kind: "p", text: "The paragraph that belongs with the next topic stays on that heading page." },
+      ],
+    },
+  ], "Psych")
+  const text = new TextDecoder().decode(pdf)
+  const together = text.split("endstream").some((stream) => stream.includes("(The next topic)") && stream.includes("(The paragraph that belongs"))
+  assert.equal(together, true)
+})
+
+test("gives each contents entry its own row", () => {
+  const pdf = buildLibbyPdf([
+    { title: "Ivan Pavlov", blocks: [{ kind: "p", text: "Dogs and bells." }] },
+    { title: "B. F. Skinner", blocks: [{ kind: "p", text: "Boxes and behavior." }] },
+  ], "Psych")
+  const text = new TextDecoder().decode(pdf)
+  const contents = text.split("endstream").find((stream) => stream.includes("(Contents)") && stream.includes("(Ivan Pavlov)"))
+  const baselines = [...contents.matchAll(/([\d.]+) Td \(Ivan Pavlov\)|([\d.]+) Td \(B\. F\. Skinner\)/g)]
+    .map((hit) => Number(hit[1] || hit[2]))
+  assert.equal(baselines.length, 2)
+  assert.ok(baselines[0] - baselines[1] >= 28)
+})
+
 test("reads the page footer even when the cover badge sits between the numbers", () => {
   const marker = pageMarkerFromText(`Cover text ${"x".repeat(3000)} pp. 1-2 ${"y".repeat(900)} of 480 later`)
   assert.equal(marker.label, "pp. 1-2 of 480")
