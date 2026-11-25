@@ -171,7 +171,11 @@ async fn drop_torrent(app: &AppHandle, torrent_id: Option<usize>, pause_only: bo
 
 /// Cancelar / pausar / retomar: a mesma sequencia dos comandos Tauri
 /// (mexe na fila, emite o estado novo e tenta comecar o proximo).
-async fn queue_control(app: &AppHandle, id: u64, action: &str) -> Result<Value, String> {
+pub(crate) async fn queue_control(
+    app: &AppHandle,
+    id: u64,
+    action: &str,
+) -> Result<Value, String> {
     use tauri::Manager;
     let state = app.state::<crate::AppState>();
     let (changed, torrent_id) = {

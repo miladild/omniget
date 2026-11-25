@@ -17,6 +17,10 @@
 //!                         host accepted (`ExtensionPayload`). Validates the
 //!                         URL, writes cookies + metadata to disk, then queues
 //!                         the URL through `external_url::handle_external_url`.
+//! * `POST /v1/control` — authenticated; `{ id, action }` with action `pause`,
+//!                         `resume` or `cancel`, applied exactly as the MCP
+//!                         download tools apply it. Does not need the MCP
+//!                         server to be enabled.
 //! * `GET  /media/{t}`  — unauthenticated by design; streams one file the app
 //!   itself granted via `media_stream_url` (unguessable, expiring token).
 //!   This is how the webview plays local video/audio: WebKitGTK's media
@@ -378,6 +382,18 @@ struct CookiesRequest {
     alias: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ControlRequest {
+    id: u64,
+    action: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ControlResponse {
+    ok: bool,
+    item: serde_json::Value,
+}
+
 const HOST_MAX_PROTOCOL_VERSION: u32 = 1;
 
 /// Body cap for `/v1/enqueue`, kept a little above the extension's own 4 MiB
@@ -516,6 +532,7 @@ pub async fn spawn(app: AppHandle) {
         .route("/v1/queue", get(queue_state))
         .route("/v1/log/{id}", get(download_log))
         .route("/v1/cookies", post(cookies_export))
+        .route("/v1/control", post(control))
         .route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .with_state(state)
         .layer(cors);
@@ -863,6 +880,46 @@ async fn cookies_export(
     (StatusCode::OK, body).into_response()
 }
 
+/// Maps the wire action onto the one `queue_control` understands; anything
+/// else is refused before the queue is touched.
+fn parse_control_action(raw: &str) -> Option<&'static str> {
+    match raw {
+        "pause" => Some("pause"),
+        "resume" => Some("resume"),
+        "cancel" => Some("cancel"),
+        _ => None,
+    }
+}
+
+/// `POST /v1/control`: pause, resume or cancel one download, with the same
+/// queue behaviour as the MCP `download_*` tools. Mesmo bearer do `enqueue`.
+async fn control(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(request): Json<ControlRequest>,
+) -> Response {
+    if !check_bearer(&headers, &state.token) {
+        return unauthorized();
+    }
+    let Some(action) = parse_control_action(&request.action) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "INVALID_ACTION",
+            format!(
+                "Unknown action '{}'; expected pause, resume or cancel",
+                request.action
+            ),
+        );
+    };
+    match crate::mcp::queue_control(&state.app, request.id, action).await {
+        Ok(result) => {
+            let item = result.get("item").cloned().unwrap_or(serde_json::Value::Null);
+            (StatusCode::OK, Json(ControlResponse { ok: true, item })).into_response()
+        }
+        Err(message) => error_response(StatusCode::BAD_REQUEST, "CANNOT_APPLY", message),
+    }
+}
+
 fn error_response(status: StatusCode, code: &'static str, message: String) -> Response {
     let body = Json(EnqueueResponse {
         ok: false,
@@ -988,6 +1045,19 @@ mod tests {
         ));
         assert!(parse_byte_range("bytes=9-0").is_err());
         assert!(parse_byte_range("attachments=0-9").is_err());
+    }
+
+    #[test]
+    fn control_action_accepts_the_three_queue_actions() {
+        assert_eq!(parse_control_action("pause"), Some("pause"));
+        assert_eq!(parse_control_action("resume"), Some("resume"));
+        assert_eq!(parse_control_action("cancel"), Some("cancel"));
+    }
+
+    #[test]
+    fn control_action_rejects_unknown_actions() {
+        assert_eq!(parse_control_action("delete"), None);
+        assert_eq!(parse_control_action(""), None);
     }
 
     #[test]
