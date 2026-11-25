@@ -18,9 +18,16 @@
 //!                         URL, writes cookies + metadata to disk, then queues
 //!                         the URL through `external_url::handle_external_url`.
 //! * `POST /v1/control` — authenticated; `{ id, action }` with action `pause`,
-//!                         `resume` or `cancel`, applied exactly as the MCP
-//!                         download tools apply it. Does not need the MCP
-//!                         server to be enabled.
+//!                         `resume`, `cancel`, `retry` or `remove` (list only,
+//!                         never the file), or `clear_finished` (no id). Each
+//!                         runs the same Tauri command the Downloads screen
+//!                         calls. Does not need the MCP server to be enabled.
+//! * `GET  /v1/history` — authenticated; the completed-download history array
+//!                         (`queue_history::HistoryEntry`).
+//! * `GET  /v1/speed-limit` — authenticated; `{ value }`, the saved
+//!                         `download.speed_limit` ("" = unlimited).
+//! * `POST /v1/speed-limit` — authenticated; `{ value }`, validated and saved
+//!                         the way the Settings UI saves it.
 //! * `GET  /media/{t}`  — unauthenticated by design; streams one file the app
 //!   itself granted via `media_stream_url` (unguessable, expiring token).
 //!   This is how the webview plays local video/audio: WebKitGTK's media
@@ -384,7 +391,9 @@ struct CookiesRequest {
 
 #[derive(Debug, Deserialize)]
 struct ControlRequest {
-    id: u64,
+    /// Required by every action except `clear_finished`; checked in [`control`].
+    #[serde(default)]
+    id: Option<u64>,
     action: String,
 }
 
@@ -392,6 +401,27 @@ struct ControlRequest {
 struct ControlResponse {
     ok: bool,
     item: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct AckResponse {
+    ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SpeedLimitValue {
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpeedLimitRequest {
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SavedSpeedLimit {
+    ok: bool,
+    value: String,
 }
 
 const HOST_MAX_PROTOCOL_VERSION: u32 = 1;
@@ -533,6 +563,11 @@ pub async fn spawn(app: AppHandle) {
         .route("/v1/log/{id}", get(download_log))
         .route("/v1/cookies", post(cookies_export))
         .route("/v1/control", post(control))
+        .route("/v1/history", get(history))
+        .route(
+            "/v1/speed-limit",
+            get(get_speed_limit).post(set_speed_limit),
+        )
         .route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_get))
         .with_state(state)
         .layer(cors);
@@ -880,19 +915,22 @@ async fn cookies_export(
     (StatusCode::OK, body).into_response()
 }
 
-/// Maps the wire action onto the one `queue_control` understands; anything
-/// else is refused before the queue is touched.
+/// Maps the wire action onto the name the handlers dispatch on; anything else
+/// is refused before the queue is touched.
 fn parse_control_action(raw: &str) -> Option<&'static str> {
     match raw {
         "pause" => Some("pause"),
         "resume" => Some("resume"),
         "cancel" => Some("cancel"),
+        "retry" => Some("retry"),
+        "remove" => Some("remove"),
+        "clear_finished" => Some("clear_finished"),
         _ => None,
     }
 }
 
-/// `POST /v1/control`: pause, resume or cancel one download, with the same
-/// queue behaviour as the MCP `download_*` tools. Mesmo bearer do `enqueue`.
+/// `POST /v1/control`: one Downloads-screen action on one download, or
+/// `clear_finished` for the whole list. Mesmo bearer do `enqueue`.
 async fn control(
     State(state): State<BridgeState>,
     headers: HeaderMap,
@@ -906,17 +944,147 @@ async fn control(
             StatusCode::BAD_REQUEST,
             "INVALID_ACTION",
             format!(
-                "Unknown action '{}'; expected pause, resume or cancel",
+                "Unknown action '{}'; expected pause, resume, cancel, retry, remove or clear_finished",
                 request.action
             ),
         );
     };
-    match crate::mcp::queue_control(&state.app, request.id, action).await {
+    if action == "clear_finished" {
+        return ack_response(clear_finished_list(&state.app).await);
+    }
+    let Some(id) = request.id else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "MISSING_ID",
+            format!("Action '{action}' needs an id"),
+        );
+    };
+    match action {
+        "retry" => ack_response(retry_listed(&state.app, id).await),
+        "remove" => ack_response(remove_from_list(&state.app, id).await),
+        _ => queue_action_response(&state.app, id, action).await,
+    }
+}
+
+/// Pause, resume or cancel through the MCP queue path, which also returns the
+/// updated item the existing clients read.
+async fn queue_action_response(app: &AppHandle, id: u64, action: &str) -> Response {
+    match crate::mcp::queue_control(app, id, action).await {
         Ok(result) => {
-            let item = result.get("item").cloned().unwrap_or(serde_json::Value::Null);
+            let item = result
+                .get("item")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             (StatusCode::OK, Json(ControlResponse { ok: true, item })).into_response()
         }
         Err(message) => error_response(StatusCode::BAD_REQUEST, "CANNOT_APPLY", message),
+    }
+}
+
+fn ack_response(result: Result<String, String>) -> Response {
+    match result {
+        Ok(_) => (StatusCode::OK, Json(AckResponse { ok: true })).into_response(),
+        Err(message) => error_response(StatusCode::BAD_REQUEST, "CANNOT_APPLY", message),
+    }
+}
+
+async fn retry_listed(app: &AppHandle, id: u64) -> Result<String, String> {
+    crate::commands::downloads::retry_download(app.clone(), app.state(), id).await
+}
+
+/// Removes the list entry only: `delete_file` is `Some(false)`, so the
+/// downloaded file stays on disk.
+async fn remove_from_list(app: &AppHandle, id: u64) -> Result<String, String> {
+    crate::commands::downloads::remove_download(app.clone(), app.state(), id, Some(false)).await
+}
+
+async fn clear_finished_list(app: &AppHandle) -> Result<String, String> {
+    crate::commands::downloads::clear_finished_downloads(app.clone(), app.state()).await
+}
+
+/// `GET /v1/history`: the completed-download history, newest first.
+async fn history(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !check_bearer(&headers, &state.token) {
+        return unauthorized();
+    }
+    let entries = crate::core::queue_history::list();
+    (StatusCode::OK, Json(entries)).into_response()
+}
+
+/// `GET /v1/speed-limit`: the saved limit as the Settings UI stores it.
+async fn get_speed_limit(State(state): State<BridgeState>, headers: HeaderMap) -> Response {
+    if !check_bearer(&headers, &state.token) {
+        return unauthorized();
+    }
+    let value = config::load_settings(&state.app).download.speed_limit;
+    (StatusCode::OK, Json(SpeedLimitValue { value })).into_response()
+}
+
+/// `POST /v1/speed-limit`: validates the value with the Settings UI's rule and
+/// saves it. The download path reads the setting from disk on every run, so
+/// nothing else needs to be signalled.
+async fn set_speed_limit(
+    State(state): State<BridgeState>,
+    headers: HeaderMap,
+    Json(request): Json<SpeedLimitRequest>,
+) -> Response {
+    if !check_bearer(&headers, &state.token) {
+        return unauthorized();
+    }
+    let value = match normalize_speed_limit(&request.value) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "INVALID_SPEED_LIMIT", message)
+        }
+    };
+    let mut settings = config::load_settings(&state.app);
+    settings.download.speed_limit = value.clone();
+    if let Err(error) = config::save_settings(&state.app, &settings) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WRITE_FAILED",
+            format!("save speed limit: {error}"),
+        );
+    }
+    (StatusCode::OK, Json(SavedSpeedLimit { ok: true, value })).into_response()
+}
+
+/// Turns a typed speed limit into the stored form the Settings UI writes:
+/// `""` (unlimited, also for zero), or a positive number with a `K` or `M`
+/// suffix such as `500K` or `1.5M`. The UI reads a bare number as megabytes,
+/// so a bare number is stored with `M`.
+fn normalize_speed_limit(raw: &str) -> Result<String, String> {
+    const INVALID: &str = "Speed limit must be empty, or a number with K or M such as 500K or 5M";
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let (digits, unit) = match trimmed.chars().last() {
+        Some(suffix @ ('K' | 'k' | 'M' | 'm')) => (
+            &trimmed[..trimmed.len() - suffix.len_utf8()],
+            suffix.to_ascii_uppercase(),
+        ),
+        _ => (trimmed, 'M'),
+    };
+    if !is_plain_decimal(digits) {
+        return Err(INVALID.to_string());
+    }
+    let amount: f64 = digits.parse().map_err(|_| INVALID.to_string())?;
+    if !amount.is_finite() {
+        return Err(INVALID.to_string());
+    }
+    if amount == 0.0 {
+        return Ok(String::new());
+    }
+    Ok(format!("{amount}{unit}"))
+}
+
+/// `\d+(\.\d+)?` with ASCII digits only, as the Settings UI matches it.
+fn is_plain_decimal(text: &str) -> bool {
+    let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    match text.split_once('.') {
+        Some((whole, fraction)) => all_digits(whole) && all_digits(fraction),
+        None => all_digits(text),
     }
 }
 
@@ -1055,9 +1223,57 @@ mod tests {
     }
 
     #[test]
+    fn control_action_accepts_the_downloads_screen_actions() {
+        assert_eq!(parse_control_action("retry"), Some("retry"));
+        assert_eq!(parse_control_action("remove"), Some("remove"));
+        assert_eq!(
+            parse_control_action("clear_finished"),
+            Some("clear_finished")
+        );
+    }
+
+    #[test]
     fn control_action_rejects_unknown_actions() {
         assert_eq!(parse_control_action("delete"), None);
+        assert_eq!(parse_control_action("clearFinished"), None);
         assert_eq!(parse_control_action(""), None);
+    }
+
+    #[test]
+    fn speed_limit_accepts_empty_as_unlimited() {
+        assert_eq!(normalize_speed_limit(""), Ok(String::new()));
+        assert_eq!(normalize_speed_limit("   "), Ok(String::new()));
+        assert_eq!(normalize_speed_limit("0"), Ok(String::new()));
+        assert_eq!(normalize_speed_limit("0M"), Ok(String::new()));
+    }
+
+    #[test]
+    fn speed_limit_accepts_typical_values_in_the_ui_format() {
+        assert_eq!(normalize_speed_limit("5M"), Ok("5M".to_string()));
+        assert_eq!(normalize_speed_limit("500K"), Ok("500K".to_string()));
+        assert_eq!(normalize_speed_limit("1.5M"), Ok("1.5M".to_string()));
+        assert_eq!(normalize_speed_limit(" 750k "), Ok("750K".to_string()));
+        assert_eq!(normalize_speed_limit("2m"), Ok("2M".to_string()));
+    }
+
+    #[test]
+    fn speed_limit_reads_a_bare_number_as_megabytes() {
+        assert_eq!(normalize_speed_limit("5"), Ok("5M".to_string()));
+    }
+
+    #[test]
+    fn speed_limit_rejects_junk() {
+        for raw in [
+            "abc", "5MB", "-5M", "1e3K", "5..0M", "M", "K", ".5M", "5.", "5 M", "inf", "1K2",
+        ] {
+            assert!(normalize_speed_limit(raw).is_err(), "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn speed_limit_rejects_a_value_that_is_not_finite() {
+        let huge = format!("{}M", "9".repeat(400));
+        assert!(normalize_speed_limit(&huge).is_err());
     }
 
     #[test]
